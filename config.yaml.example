@@ -1,0 +1,43 @@
+team_name: "研发一组"
+
+schedule:
+  hour: 18
+  minute: 0
+  skip_weekends: true
+  holidays: []
+
+github:
+  token_env: "GITHUB_TOKEN"
+  repos:
+    - "org/repo-a"
+
+lark:
+  app_id_env: "LARK_APP_ID"
+  app_secret_env: "LARK_APP_SECRET"
+  # 飞书任务清单 GUID（URL: .../task/task-lists/<这里>）
+  tasklist_id: "aeabc15e-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
+email:
+  smtp_host: "smtp.company.com"
+  smtp_port: 465
+  use_ssl: true
+  username_env: "SMTP_USERNAME"
+  password_env: "SMTP_PASSWORD"
+  from_addr: "daily-report@company.com"
+  recipients:
+    - "leader@company.com"
+
+storage:
+  db_path: "data/daily_reports.db"
+
+members:
+  - name: "张三"
+    github: "zhangsan"
+    lark: "zhangsan@company.com"
+    # lark_open_id: "ou_xxx"
+  - name: "李四"
+    github: "lisi-dev"
+    lark: "lisi@company.com"
+  - name: "王五"
+    github: "wangwu"
+    lark: "wangwu@company.com"
