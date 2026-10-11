@@ -10,6 +10,15 @@ T = TypeVar("T")
 
 
 @dataclass
+class FileChange:
+    """单个文件的改动明细。"""
+    filename: str
+    status: str = "modified"     # added / modified / removed / renamed
+    additions: int = 0
+    deletions: int = 0
+
+
+@dataclass
 class CommitRecord:
     author: str
     message: str
@@ -20,6 +29,18 @@ class CommitRecord:
     files_changed: int
     sha: str = ""
     files: list[str] = field(default_factory=list)
+    url: str = ""
+    file_details: list[FileChange] = field(default_factory=list)
+
+
+@dataclass
+class EventRecord:
+    """GitHub 公开活动（Events API）。"""
+    actor: str
+    event_type: str
+    repo: str
+    summary: str
+    timestamp: datetime
     url: str = ""
 
 

@@ -1,43 +1,64 @@
-team_name: "研发一组"
-
+ team_name: 研发一组
 schedule:
   hour: 18
   minute: 0
   skip_weekends: true
   holidays: []
-
 github:
-  token_env: "GITHUB_TOKEN"
+  token_env: GITHUB_TOKEN
   repos:
-    - "org/repo-a"
-
+  - octocat/Hello-World
 lark:
-  app_id_env: "LARK_APP_ID"
-  app_secret_env: "LARK_APP_SECRET"
-  # 飞书任务清单 GUID（URL: .../task/task-lists/<这里>）
-  tasklist_id: "aeabc15e-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-
+  app_id_env: LARK_APP_ID
+  app_secret_env: LARK_APP_SECRET
+  tasklist_id: aeabc15e-dd81-4d42-a559-6b7fb0aff2dd
 email:
-  smtp_host: "smtp.company.com"
+  smtp_host: smtp.company.com
   smtp_port: 465
   use_ssl: true
-  username_env: "SMTP_USERNAME"
-  password_env: "SMTP_PASSWORD"
-  from_addr: "daily-report@company.com"
+  username_env: SMTP_USERNAME
+  password_env: SMTP_PASSWORD
+  from_addr: daily-report@company.com
   recipients:
-    - "leader@company.com"
-
+  - leader@company.com
 storage:
-  db_path: "data/daily_reports.db"
+  db_path: data/daily_reports.db
+members:
+- name: 张三
+  github: zhangsan
+  lark: zhangsan@company.com
+email:
+  smtp_host: smtp.qq.com
+  smtp_port: 465
+  use_ssl: true
+
+  # 发件人（你自己）
+  from_addr: 2327929235@qq.com
+
+  # 收件人（日报发到哪）★ 就是这里
+  recipients:
+    - 2327929235@qq.com          # 自己
+    - liuyuke_1@outlook.com      # 想发给别人就加这行
+    github:
+  repos:
+    - lyk669/smart-daily-report-system-hw
+    team_name: 智能日报团队
+
+github:
+  repos:
+    - lyk669/smart-daily-report-system-hw
+
+email:
+  smtp_host: smtp.qq.com
+  smtp_port: 465
+  use_ssl: true
+  from_addr: 2327929235@qq.com
+  recipients:
+    - 2327929235@qq.com
 
 members:
-  - name: "张三"
-    github: "zhangsan"
-    lark: "zhangsan@company.com"
-    # lark_open_id: "ou_xxx"
-  - name: "李四"
-    github: "lisi-dev"
-    lark: "lisi@company.com"
-  - name: "王五"
-    github: "wangwu"
-    lark: "wangwu@company.com"
+  - name: 刘雨可
+    github: lyk669
+
+storage:
+  db_path: data/daily_reports.db

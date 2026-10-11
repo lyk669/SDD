@@ -1,33 +1,34 @@
-"""GitHub commit 采集。"""
+"""GitHub 用户公开活动采集（Events API）。
+
+限制：
+  · 只返回公开活动（私有仓库的活动不出现）
+  · 只保留最近 90 天
+  · 每用户最多取 3 页（90 条）
+"""
 
 from __future__ import annotations
 
-import time
 from datetime import datetime, timezone
 
 import httpx
 
 from shared.logger import get_logger
-from shared.models import CollectResult, CommitRecord
+from shared.models import CollectResult, EventRecord
 from shared.retry import with_retries
 
-logger = get_logger("daily_report.collector.github")
+logger = get_logger("daily_report.collector.github_events")
 
 GITHUB_API = "https://api.github.com"
 
 
 def collect(
-    repos: list[str],
+    usernames: list[str],
     since: datetime,
     until: datetime,
     *,
     token: str | None = None,
     client: httpx.Client | None = None,
-) -> CollectResult[CommitRecord]:
-    """获取指定仓库在 [since, until) 内的 commit 记录。
-
-    多仓隔离：单个仓库失败不影响其他仓库已采集的数据。
-    """
+) -> CollectResult[EventRecord]:
     owns_client = client is None
     client = client or httpx.Client(
         base_url=GITHUB_API,
@@ -39,161 +40,162 @@ def collect(
         timeout=30.0,
     )
 
-    records: list[CommitRecord] = []
+    records: list[EventRecord] = []
     errors: list[str] = []
     try:
-        for repo in repos:
+        for username in usernames:
             try:
-                records.extend(_collect_repo(client, repo, since, until))
+                records.extend(_collect_user(client, username, since, until))
             except Exception as exc:  # noqa: BLE001
-                logger.error(f"GitHub 仓库采集失败 {repo}: {exc}")
-                errors.append(f"{repo}: {exc}")
+                logger.error(f"GitHub 活动采集失败 {username}: {exc}")
+                errors.append(f"{username}: {exc}")
 
         if errors and not records:
-            return CollectResult(
-                success=False,
-                records=[],
-                error_message="; ".join(errors),
-            )
+            return CollectResult(success=False, records=[], error_message="; ".join(errors))
         if errors:
-            return CollectResult(
-                success=False,
-                records=records,
-                error_message="; ".join(errors),
-            )
+            return CollectResult(success=False, records=records, error_message="; ".join(errors))
         return CollectResult(success=True, records=records)
     finally:
         if owns_client:
             client.close()
 
 
-def _collect_repo(
+def _collect_user(
     client: httpx.Client,
-    repo: str,
+    username: str,
     since: datetime,
     until: datetime,
-) -> list[CommitRecord]:
-    records: list[CommitRecord] = []
+) -> list[EventRecord]:
+    records: list[EventRecord] = []
     page = 1
-    since_iso = _to_iso(since)
-    until_iso = _to_iso(until)
+    max_pages = 3
 
-    while True:
-        def _request(current_page: int = page) -> httpx.Response:
+    while page <= max_pages:
+        def _request(p: int = page) -> httpx.Response:
             resp = client.get(
-                f"/repos/{repo}/commits",
-                params={
-                    "since": since_iso,
-                    "until": until_iso,
-                    "per_page": 100,
-                    "page": current_page,
-                },
+                f"/users/{username}/events",
+                params={"per_page": 30, "page": p},
             )
-            resp = _handle_rate_limit(client, resp, repo, since_iso, until_iso, current_page)
             resp.raise_for_status()
             return resp
 
-        response = with_retries(_request, max_attempts=3, delay_seconds=5.0)
-        payload = response.json()
+        try:
+            payload = with_retries(_request, max_attempts=3, delay_seconds=5.0).json()
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"获取 {username} 活动失败 page={page}: {exc}")
+            break
+
         if not payload:
             break
 
+        stop = False
         for item in payload:
-            sha = item.get("sha")
-            commit = item.get("commit") or {}
-            author_info = commit.get("author") or {}
-            author_login = (
-                (item.get("author") or {}).get("login")
-                or author_info.get("name")
-                or "unknown"
-            )
-            stats = _fetch_detail(client, repo, sha) if sha else (0, 0, 0, [], "")
+            ts = _parse_dt(item.get("created_at"))
+            if ts < since:
+                stop = True
+                break
+            if ts >= until:
+                continue
+            summary, url = _describe(item)
+            if summary is None:
+                continue
             records.append(
-                CommitRecord(
-                    author=author_login,
-                    message=(commit.get("message") or "").split("\n", 1)[0],
-                    timestamp=_parse_dt(author_info.get("date")),
-                    repo=repo,
-                    additions=stats[0],
-                    deletions=stats[1],
-                    files_changed=stats[2],
-                    sha=sha or "",
-                    files=stats[3],
-                    url=stats[4] or f"https://github.com/{repo}/commit/{sha}" if sha else "",
+                EventRecord(
+                    actor=username,
+                    event_type=item.get("type", ""),
+                    repo=(item.get("repo") or {}).get("name", ""),
+                    summary=summary,
+                    timestamp=ts,
+                    url=url,
                 )
             )
 
-        if len(payload) < 100:
+        if stop or len(payload) < 30:
             break
         page += 1
 
     return records
 
 
-def _handle_rate_limit(
-    client: httpx.Client,
-    resp: httpx.Response,
-    repo: str,
-    since_iso: str,
-    until_iso: str,
-    page: int,
-) -> httpx.Response:
-    if resp.status_code != 403:
-        return resp
-    text = resp.text.lower()
-    if "rate limit" not in text and "secondary rate" not in text:
-        return resp
+def _describe(item: dict) -> tuple[str | None, str]:
+    """把 event 转成中文摘要。返回 (None, "") 表示跳过。"""
+    etype = item.get("type", "")
+    repo = (item.get("repo") or {}).get("name", "")
+    payload = item.get("payload") or {}
 
-    reset = int(resp.headers.get("X-RateLimit-Reset", "0") or 0)
-    wait = max(reset - int(datetime.now(timezone.utc).timestamp()), 1)
-    # 上限 120s，避免联调卡死；仍尊重 reset 语义
-    wait = min(wait, 120)
-    logger.error(f"GitHub 限流 {repo}，等待 {wait}s 后重试")
-    time.sleep(wait)
-    retry = client.get(
-        f"/repos/{repo}/commits",
-        params={
-            "since": since_iso,
-            "until": until_iso,
-            "per_page": 100,
-            "page": page,
-        },
-    )
-    return retry
+    if etype == "PushEvent":
+        commits = payload.get("commits") or []
+        n = len(commits)
+        if n == 0:
+            return None, ""
+        return f"push 到 {repo}（{n} 个提交）", f"https://github.com/{repo}"
 
+    if etype == "PullRequestEvent":
+        action = payload.get("action", "")
+        pr = payload.get("pull_request") or {}
+        num = pr.get("number", "")
+        title = pr.get("title", "")
+        action_cn = {
+            "opened": "打开", "closed": "关闭",
+            "merged": "合并", "reopened": "重新打开",
+        }.get(action, action)
+        url = pr.get("html_url", "")
+        return f"{action_cn} PR #{num} · {title}（{repo}）", url
 
-def _fetch_detail(
-    client: httpx.Client, repo: str, sha: str
-) -> tuple[int, int, int, list[str], str]:
-    """取提交统计与改动文件路径（不含 patch/源码正文）。"""
+    if etype == "PullRequestReviewEvent":
+        pr = payload.get("pull_request") or {}
+        num = pr.get("number", "")
+        return f"review 了 PR #{num}（{repo}）", pr.get("html_url", "")
 
-    def _request() -> httpx.Response:
-        resp = client.get(f"/repos/{repo}/commits/{sha}")
-        resp.raise_for_status()
-        return resp
+    if etype == "PullRequestReviewCommentEvent":
+        pr = payload.get("pull_request") or {}
+        num = pr.get("number", "")
+        return f"评论 PR #{num}（{repo}）", pr.get("html_url", "")
 
-    try:
-        detail = with_retries(_request, max_attempts=3, delay_seconds=5.0).json()
-        stats = detail.get("stats") or {}
-        files = detail.get("files") or []
-        names = [str(f.get("filename") or "").strip() for f in files]
-        names = [n for n in names if n][:40]
-        return (
-            int(stats.get("additions") or 0),
-            int(stats.get("deletions") or 0),
-            len(files),
-            names,
-            str(detail.get("html_url") or ""),
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.error(f"获取 commit 详情失败 {repo}@{sha}: {exc}")
-        return 0, 0, 0, [], ""
+    if etype == "IssuesEvent":
+        action = payload.get("action", "")
+        issue = payload.get("issue") or {}
+        num = issue.get("number", "")
+        title = issue.get("title", "")
+        action_cn = {
+            "opened": "打开", "closed": "关闭", "reopened": "重新打开",
+        }.get(action, action)
+        return f"{action_cn} issue #{num} · {title}（{repo}）", issue.get("html_url", "")
 
+    if etype == "IssueCommentEvent":
+        issue = payload.get("issue") or {}
+        num = issue.get("number", "")
+        return f"评论 issue #{num}（{repo}）", issue.get("html_url", "")
 
-def _to_iso(dt: datetime) -> str:
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if etype == "CreateEvent":
+        ref_type = payload.get("ref_type", "")
+        ref = payload.get("ref", "")
+        if ref_type == "repository":
+            return f"创建仓库 {repo}", f"https://github.com/{repo}"
+        type_cn = {"branch": "分支", "tag": "标签"}.get(ref_type, ref_type)
+        return f"创建{type_cn} {ref}（{repo}）", f"https://github.com/{repo}"
+
+    if etype == "DeleteEvent":
+        ref_type = payload.get("ref_type", "")
+        ref = payload.get("ref", "")
+        type_cn = {"branch": "分支", "tag": "标签"}.get(ref_type, ref_type)
+        return f"删除{type_cn} {ref}（{repo}）", f"https://github.com/{repo}"
+
+    if etype == "WatchEvent":
+        return f"star 了 {repo}", f"https://github.com/{repo}"
+
+    if etype == "ForkEvent":
+        return f"fork 了 {repo}", f"https://github.com/{repo}"
+
+    if etype == "ReleaseEvent":
+        rel = payload.get("release") or {}
+        tag = rel.get("tag_name", "")
+        return f"发布 release {tag}（{repo}）", rel.get("html_url", "")
+
+    if etype == "PublicEvent":
+        return f"公开仓库 {repo}", f"https://github.com/{repo}"
+
+    return None, ""
 
 
 def _parse_dt(value: str | None) -> datetime:

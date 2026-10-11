@@ -12,14 +12,15 @@ import yaml
 from shared.errors import ConfigError
 
 
-REQUIRED_TOP_KEYS = ("team_name", "github", "lark", "email", "members", "storage")
+# 顶层必填字段：lark 改为可选（只用 GitHub 时不配飞书也能跑）
+REQUIRED_TOP_KEYS = ("team_name", "github", "email", "members", "storage")
 
 
 @dataclass
 class MemberConfig:
     name: str
-    github: str
-    lark: str
+    github: str = ""
+    lark: str = ""
     lark_open_id: str | None = None
     lark_user_id: str | None = None
 
@@ -37,10 +38,10 @@ class MemberConfig:
 class AppConfig:
     team_name: str
     github: dict[str, Any]
-    lark: dict[str, Any]
     email: dict[str, Any]
     storage: dict[str, Any]
     members: list[MemberConfig]
+    lark: dict[str, Any] = field(default_factory=dict)
     schedule: dict[str, Any] = field(default_factory=dict)
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
 
@@ -48,13 +49,22 @@ class AppConfig:
         return _env(self.github.get("token_env", "GITHUB_TOKEN"))
 
     def lark_credentials(self) -> tuple[str, str]:
-        app_id = _env(self.lark.get("app_id_env", "LARK_APP_ID"))
-        app_secret = _env(self.lark.get("app_secret_env", "LARK_APP_SECRET"))
+        """飞书凭证。未配置时返回空串，由调用方决定是否跳过。"""
+        app_id = os.environ.get(self.lark.get("app_id_env", "LARK_APP_ID"), "").strip()
+        app_secret = os.environ.get(
+            self.lark.get("app_secret_env", "LARK_APP_SECRET"), ""
+        ).strip()
         return app_id, app_secret
 
     def smtp_credentials(self) -> tuple[str, str]:
-        user = _env(self.email.get("username_env", "SMTP_USERNAME"))
-        password = _env(self.email.get("password_env", "SMTP_PASSWORD"))
+        """发件人凭证。优先 SMTP_USER，其次 SMTP_USERNAME。"""
+        user = (
+            os.environ.get(self.email.get("username_env", "SMTP_USER"), "").strip()
+            or os.environ.get("SMTP_USERNAME", "").strip()
+        )
+        password = os.environ.get(self.email.get("password_env", "SMTP_PASSWORD"), "").strip()
+        if not user or not password:
+            raise ConfigError("缺少 SMTP_USER / SMTP_PASSWORD（请在 .env 中配置）")
         return user, password
 
 
@@ -86,14 +96,15 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
 
     members: list[MemberConfig] = []
     for i, item in enumerate(members_raw):
-        for key in ("name", "github", "lark"):
-            if not item.get(key):
-                raise ConfigError(f"members[{i}] 缺少必填字段: {key}")
+        if not item.get("name"):
+            raise ConfigError(f"members[{i}] 缺少必填字段: name")
+        if not item.get("github"):
+            raise ConfigError(f"members[{i}] 缺少必填字段: github")
         members.append(
             MemberConfig(
                 name=item["name"],
                 github=item["github"],
-                lark=item["lark"],
+                lark=item.get("lark", ""),
                 lark_open_id=item.get("lark_open_id") or item.get("open_id"),
                 lark_user_id=item.get("lark_user_id") or item.get("user_id"),
             )
@@ -101,21 +112,28 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
 
     if not data["github"].get("repos"):
         raise ConfigError("github.repos 不能为空")
-    if not data["lark"].get("tasklist_id") and not data["lark"].get("project_id"):
-        raise ConfigError("lark.tasklist_id 不能为空（飞书任务清单 URL 中 task-lists/ 后的 GUID）")
-    # 兼容旧字段名 project_id
-    if not data["lark"].get("tasklist_id") and data["lark"].get("project_id"):
-        data["lark"]["tasklist_id"] = data["lark"]["project_id"]
+
     if not data["storage"].get("db_path"):
         raise ConfigError("storage.db_path 不能为空")
+
+    # 收件人：允许 config.recipients 为空，由 main.py 兜底
+    # 这里只做类型校验
+    email_cfg = data["email"] or {}
+    if "recipients" in email_cfg and email_cfg["recipients"] is None:
+        email_cfg["recipients"] = []
+
+    lark_cfg = data.get("lark") or {}
+    # 兼容旧字段名 project_id
+    if not lark_cfg.get("tasklist_id") and lark_cfg.get("project_id"):
+        lark_cfg["tasklist_id"] = lark_cfg["project_id"]
 
     return AppConfig(
         team_name=data["team_name"],
         github=data["github"],
-        lark=data["lark"],
-        email=data["email"],
+        email=email_cfg,
         storage=data["storage"],
         members=members,
+        lark=lark_cfg,
         schedule=data.get("schedule") or {},
         raw=data,
     )
