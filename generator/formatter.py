@@ -1,6 +1,6 @@
 """日报生成器 — 输出 Markdown + HTML。
 
-格式：顶部概览 → 仓库 → 成员 → 按时间段分组 → 每条 commit 明细 → 公开活动 → 底部来源
+格式：顶部概览 → 本次新增/删除文件 → 仓库 → 成员 → 按时间段分组 → commit 明细 → 公开活动 → 底部来源
 """
 
 from __future__ import annotations
@@ -22,8 +22,6 @@ class Report:
     html: str
     generated_at: datetime
 
-
-# ---------- 图标 / 状态 / 星期 ----------
 
 _ICON_MAP = {
     ".py": "🐍", ".pyi": "🐍",
@@ -139,6 +137,43 @@ def _shorten(s: str, max_w: int = 30) -> str:
     return "".join(out)
 
 
+def _collect_files_by_status(all_commits: list, target_statuses: set[str]) -> list:
+    """收集指定 status 的文件，去重（同一文件只保留一次）。
+
+    返回 [{"filename", "additions", "deletions", "repo", "sha"}, ...]，按文件名排序。
+    """
+    seen: set[str] = set()
+    result: list[dict] = []
+    for c in all_commits:
+        repo = getattr(c, "repo", "") or ""
+        sha = getattr(c, "sha", "") or ""
+        for fd in _commit_files(c):
+            st = (getattr(fd, "status", "") or "").lower()
+            if st not in target_statuses:
+                continue
+            fname = getattr(fd, "filename", "") or ""
+            if not fname or fname in seen:
+                continue
+            seen.add(fname)
+            result.append({
+                "filename": fname,
+                "additions": int(getattr(fd, "additions", 0) or 0),
+                "deletions": int(getattr(fd, "deletions", 0) or 0),
+                "repo": repo,
+                "sha": sha,
+            })
+    result.sort(key=lambda x: x["filename"])
+    return result
+
+
+def _collect_new_files(all_commits: list) -> list:
+    return _collect_files_by_status(all_commits, {"added"})
+
+
+def _collect_deleted_files(all_commits: list) -> list:
+    return _collect_files_by_status(all_commits, {"removed", "deleted"})
+
+
 # ---------- Markdown ----------
 
 def _render_markdown(
@@ -157,7 +192,6 @@ def _render_markdown(
     net = total_add - total_del
     repos = sorted({getattr(c, "repo", "") for c in all_commits if getattr(c, "repo", "")})
 
-    # 文件状态计数
     added = modified = removed = 0
     for c in all_commits:
         for fd in _commit_files(c):
@@ -169,6 +203,8 @@ def _render_markdown(
             else:
                 modified += 1
 
+    new_files = _collect_new_files(all_commits)
+    deleted_files = _collect_deleted_files(all_commits)
     weekday_cn = _WEEKDAY_CN[report_date.weekday()]
 
     lines: list[str] = []
@@ -195,8 +231,29 @@ def _render_markdown(
     lines.append(f"  涉及文件    {total_files} 个（新增 {added} · 修改 {modified} · 删除 {removed}）")
     lines.append(f"  代码变更    +{total_add} / -{total_del}（净 {'+' if net >= 0 else ''}{net} 行）")
     lines.append(f"  覆盖仓库    {len(repos)} 个")
-    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     lines.append("")
+
+    # 本次新增文件（仅当有新增时展示）
+    if new_files:
+        lines.append(f"📤 本次新增文件（{len(new_files)} 个）")
+        for nf in new_files:
+            icon = _file_icon(nf["filename"])
+            name = _shorten(nf["filename"], 40)
+            add_del = f"+{nf['additions']} / -{nf['deletions']}"
+            lines.append(f"   {icon} {_pad_right(name, 42)} {add_del}")
+        lines.append("")
+
+    # 本次删除文件（仅当有删除时展示）
+    if deleted_files:
+        lines.append(f"🗑️ 本次删除文件（{len(deleted_files)} 个）")
+        for df in deleted_files:
+            icon = _file_icon(df["filename"])
+            name = _shorten(df["filename"], 40)
+            add_del = f"+{df['additions']} / -{df['deletions']}"
+            lines.append(f"   {icon} {_pad_right(name, 42)} {add_del}")
+        lines.append("")
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
     # 仓库 → 成员 → 时段 → 提交
     for repo in repos or ["（未指定仓库）"]:
@@ -335,6 +392,8 @@ def _render_html(
             else:
                 modified += 1
 
+    new_files = _collect_new_files(all_commits)
+    deleted_files = _collect_deleted_files(all_commits)
     weekday_cn = _WEEKDAY_CN[report_date.weekday()]
 
     p: list[str] = []
@@ -377,6 +436,38 @@ def _render_html(
              f"（净 <b>{'+' if net >= 0 else ''}{net}</b> 行）</td></tr>")
     p.append(f"<tr><td style='padding:2px 12px 2px 0;color:#666;'>覆盖仓库</td><td><b>{len(repos)}</b> 个</td></tr>")
     p.append("</table></div>")
+
+    # 本次新增文件
+    if new_files:
+        p.append("<div style='background:#eaf6ee;border-radius:6px;padding:12px 16px;margin:12px 0;'>")
+        p.append(f"<div style='font-weight:bold;margin-bottom:6px;'>📤 本次新增文件（{len(new_files)} 个）</div>")
+        p.append("<table style='font-size:13px;border-collapse:collapse;width:100%;'>")
+        for nf in new_files:
+            icon = _file_icon(nf["filename"])
+            p.append(
+                f"<tr><td style='padding:2px 8px 2px 0;'>"
+                f"{esc(icon)} <code>{esc(nf['filename'])}</code></td>"
+                f"<td style='padding:2px 8px;text-align:right;color:#2e7d32;'>+{nf['additions']}</td>"
+                f"<td style='padding:2px 8px;text-align:right;color:#c62828;'>-{nf['deletions']}</td>"
+                "</tr>"
+            )
+        p.append("</table></div>")
+
+    # 本次删除文件
+    if deleted_files:
+        p.append("<div style='background:#fdeaea;border-radius:6px;padding:12px 16px;margin:12px 0;'>")
+        p.append(f"<div style='font-weight:bold;margin-bottom:6px;'>🗑️ 本次删除文件（{len(deleted_files)} 个）</div>")
+        p.append("<table style='font-size:13px;border-collapse:collapse;width:100%;'>")
+        for df in deleted_files:
+            icon = _file_icon(df["filename"])
+            p.append(
+                f"<tr><td style='padding:2px 8px 2px 0;'>"
+                f"{esc(icon)} <code>{esc(df['filename'])}</code></td>"
+                f"<td style='padding:2px 8px;text-align:right;color:#2e7d32;'>+{df['additions']}</td>"
+                f"<td style='padding:2px 8px;text-align:right;color:#c62828;'>-{df['deletions']}</td>"
+                "</tr>"
+            )
+        p.append("</table></div>")
 
     for repo in repos or ["（未指定仓库）"]:
         repo_commits = [c for c in all_commits if getattr(c, "repo", "") == repo]
