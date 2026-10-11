@@ -23,6 +23,8 @@ class Report:
     generated_at: datetime
 
 
+# ---------- 图标 / 状态 / 星期 ----------
+
 _ICON_MAP = {
     ".py": "🐍", ".pyi": "🐍",
     ".js": "📜", ".mjs": "📜", ".cjs": "📜",
@@ -63,8 +65,18 @@ def _status_cn(status: str) -> str:
     return _STATUS_CN.get((status or "").lower(), "修改")
 
 
+def _to_local(dt: datetime) -> datetime:
+    """把任意带时区的 datetime 转成本地时区；失败原样返回。"""
+    try:
+        return dt.astimezone()
+    except Exception:  # noqa: BLE001
+        return dt
+
+
 def _time_slot(dt: datetime) -> str:
-    h = dt.hour
+    """按时段归组。先转本地时区再取小时，否则 UTC 会错位。"""
+    local_dt = _to_local(dt)
+    h = local_dt.hour
     if h < 12:
         return "morning"
     if h < 18:
@@ -73,12 +85,17 @@ def _time_slot(dt: datetime) -> str:
 
 
 def _fmt_time(dt: datetime | None) -> str:
+    """只显示 HH:MM（本地时区）。"""
     if dt is None:
         return "--:--"
-    try:
-        return dt.astimezone().strftime("%H:%M")
-    except Exception:  # noqa: BLE001
-        return dt.strftime("%H:%M")
+    return _to_local(dt).strftime("%H:%M")
+
+
+def _fmt_datetime(dt: datetime | None) -> str:
+    """完整日期时间：2026-10-11 14:12（本地时区）。"""
+    if dt is None:
+        return "---- --:--"
+    return _to_local(dt).strftime("%Y-%m-%d %H:%M")
 
 
 def _short_sha(sha: str | None) -> str:
@@ -222,7 +239,7 @@ def _render_markdown(
         lines.append("")
         lines.append(f"采集仓库    {', '.join(repos) if repos else '（未配置）'}")
         lines.append(f"采集窗口    {report_date.isoformat()} 00:00 ~ {_fmt_time(generated_at)}")
-        lines.append(f"生成时间    {generated_at.strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"生成时间    {_fmt_datetime(generated_at)}")
         return "\n".join(lines)
 
     # 今日概览
@@ -304,13 +321,14 @@ def _render_markdown(
                 for c in slot_commits:
                     idx += 1
                     ts = _fmt_time(getattr(c, "timestamp", None))
+                    full_ts = _fmt_datetime(getattr(c, "timestamp", None))
                     msg = (getattr(c, "message", "") or "").strip().splitlines()[0]
                     sha = _short_sha(getattr(c, "sha", ""))
                     additions = int(getattr(c, "additions", 0) or 0)
                     deletions = int(getattr(c, "deletions", 0) or 0)
                     url = _commit_link(c)
 
-                    lines.append(f"  {idx:02d}. {ts} · {msg}")
+                    lines.append(f"  {idx:02d}. {full_ts} · {msg}")
                     lines.append(f"      {sha}")
                     lines.append("")
                     lines.append("      文件                              增 / 删           状态")
@@ -354,7 +372,7 @@ def _render_markdown(
     lines.append(
         f"采集窗口    {report_date.isoformat()} 00:00 ~ {_fmt_time(generated_at)}（北京时间）"
     )
-    lines.append(f"生成时间    {generated_at.strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"生成时间    {_fmt_datetime(generated_at)}")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     return "\n".join(lines)
 
@@ -419,7 +437,7 @@ def _render_html(
             f"<p style='color:#888;font-size:13px;'>"
             f"采集仓库: {esc(', '.join(repos) or '（未配置）')}<br>"
             f"采集窗口: {esc(report_date.isoformat())} 00:00 ~ {esc(_fmt_time(generated_at))}<br>"
-            f"生成时间: {esc(generated_at.strftime('%Y-%m-%d %H:%M:%S'))}</p>"
+            f"生成时间: {esc(_fmt_datetime(generated_at))}</p>"
         )
         p.append("</body></html>")
         return "".join(p)
@@ -525,6 +543,7 @@ def _render_html(
                 for c in slot_commits:
                     idx += 1
                     ts = _fmt_time(getattr(c, "timestamp", None))
+                    full_ts = _fmt_datetime(getattr(c, "timestamp", None))
                     msg = esc((getattr(c, "message", "") or "").strip().splitlines()[0])
                     sha = esc(_short_sha(getattr(c, "sha", "")))
                     additions = int(getattr(c, "additions", 0) or 0)
@@ -535,7 +554,7 @@ def _render_html(
                         "<div style='border-left:3px solid #4a6cf7;padding:10px 14px;"
                         "margin:10px 0;background:#f8f9fc;border-radius:4px;'>"
                     )
-                    p.append(f"<div><b>{idx:02d}. {ts} · {msg}</b></div>")
+                    p.append(f"<div><b>{idx:02d}. {full_ts} · {msg}</b></div>")
                     p.append(f"<div style='color:#888;font-size:13px;margin:4px 0;'><code>{sha}</code></div>")
 
                     p.append(
@@ -604,7 +623,7 @@ def _render_html(
         f"<p style='color:#999;font-size:12px;line-height:1.8;'>"
         f"数据来源　　GitHub · {esc(', '.join(repos) or '（未配置）')}<br>"
         f"采集窗口　　{esc(report_date.isoformat())} 00:00 ~ {esc(_fmt_time(generated_at))}（北京时间）<br>"
-        f"生成时间　　{esc(generated_at.strftime('%Y-%m-%d %H:%M:%S'))}</p>"
+        f"生成时间　　{esc(_fmt_datetime(generated_at))}</p>"
     )
     p.append("</body></html>")
     return "".join(p)

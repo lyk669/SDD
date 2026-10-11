@@ -168,14 +168,16 @@ def run_collect(
     except ConfigError as exc:
         logger.error(str(exc))
 
+    branch = cfg.github.get("branch") or "main"
     commits = github_collector.collect(
         cfg.github["repos"],
         since,
         until,
+        branch=branch,
         token=github_token,
     )
     logger.info(
-        f"GitHub 采集完成: success={commits.success}, count={len(commits.records)}",
+        f"GitHub 采集完成: success={commits.success}, count={len(commits.records)}, branch={branch}",
     )
 
     if github_only:
@@ -258,9 +260,11 @@ def run_check(cfg: AppConfig) -> int:
     except ConfigError:
         pass
     logger.info(f"[check] recipients (收件人): {_resolve_recipients(cfg)}")
+    logger.info(f"[check] sender_name (显示名): {cfg.email.get('sender_name') or '(未配置)'}")
 
     try:
         token = cfg.github_token()
+        branch = cfg.github.get("branch") or "main"
         with httpx.Client(
             base_url="https://api.github.com",
             headers={
@@ -276,7 +280,7 @@ def run_check(cfg: AppConfig) -> int:
             for repo in cfg.github.get("repos") or []:
                 r = client.get(f"/repos/{repo}")
                 if r.status_code == 200:
-                    logger.info(f"[check] GitHub repo OK: {repo}")
+                    logger.info(f"[check] GitHub repo OK: {repo} (branch={branch})")
                 else:
                     ok = False
                     logger.error(f"[check] GitHub repo FAIL: {repo} ({r.status_code})")
@@ -438,6 +442,7 @@ def _send_email_with_retry(
 ) -> bool:
     user, password = cfg.smtp_credentials()
     from_addr = _resolve_sender(cfg) or user
+    sender_name = cfg.email.get("sender_name", "") or ""
 
     last_err: Exception | None = None
     for attempt in range(1, max_retries + 1):
@@ -451,6 +456,7 @@ def _send_email_with_retry(
                 username=user,
                 password=password,
                 from_addr=from_addr,
+                sender_name=sender_name,
             )
             if ok:
                 if attempt > 1:
@@ -507,7 +513,6 @@ def execute_pipeline(
             lark=lark_info,
         )
 
-    # 采集 GitHub 公开活动
     events_result = run_collect_events(cfg, since, until)
     events_records = events_result.records
     events_info = {
@@ -657,7 +662,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.auto:
         outcome = execute_pipeline(
             cfg,
-            dry_run=False,
+            dry_run=args.dry_run,     # ← 尊重 --dry-run
             force=True,
             github_only=True,
             lookback_days=1,
