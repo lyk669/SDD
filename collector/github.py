@@ -1,4 +1,4 @@
-"""GitHub commit collector."""
+"""GitHub commit collector（含 diff 抓取）。"""
 
 from __future__ import annotations
 
@@ -15,6 +15,10 @@ logger = get_logger("daily_report.collector.github")
 
 GITHUB_API = "https://api.github.com"
 
+# diff 大小限制（防止 token 爆炸）
+_MAX_PATCH_PER_FILE = 1500
+_MAX_PATCH_TOTAL = 6000
+
 
 def collect(
     repos: list[str],
@@ -25,10 +29,6 @@ def collect(
     token: str | None = None,
     client: httpx.Client | None = None,
 ) -> CollectResult[CommitRecord]:
-    """Fetch commits in [since, until) for the given repos on the specified branch.
-
-    Multi-repo isolation: one repo failing does not affect the others.
-    """
     owns_client = client is None
     client = client or httpx.Client(
         base_url=GITHUB_API,
@@ -45,21 +45,15 @@ def collect(
     try:
         for repo in repos:
             try:
-                records.extend(
-                    _collect_repo(client, repo, since, until, branch=branch)
-                )
+                records.extend(_collect_repo(client, repo, since, until, branch=branch))
             except Exception as exc:  # noqa: BLE001
                 logger.error(f"GitHub repo collect failed {repo}: {exc}")
                 errors.append(f"{repo}: {exc}")
 
         if errors and not records:
-            return CollectResult(
-                success=False, records=[], error_message="; ".join(errors),
-            )
+            return CollectResult(success=False, records=[], error_message="; ".join(errors))
         if errors:
-            return CollectResult(
-                success=False, records=records, error_message="; ".join(errors),
-            )
+            return CollectResult(success=False, records=records, error_message="; ".join(errors))
         return CollectResult(success=True, records=records)
     finally:
         if owns_client:
@@ -90,9 +84,7 @@ def _collect_repo(
                     "page": current_page,
                 },
             )
-            resp = _handle_rate_limit(
-                client, resp, repo, branch, since_iso, until_iso, current_page
-            )
+            resp = _handle_rate_limit(client, resp, repo, branch, since_iso, until_iso, current_page)
             resp.raise_for_status()
             return resp
 
@@ -123,6 +115,7 @@ def _collect_repo(
                     sha=sha or "",
                     files=detail["files"],
                     file_details=detail["file_details"],
+                    patch_text=detail.get("patch_text", ""),
                     url=detail["url"] or (
                         f"https://github.com/{repo}/commit/{sha}" if sha else ""
                     ),
@@ -137,13 +130,8 @@ def _collect_repo(
 
 
 def _handle_rate_limit(
-    client: httpx.Client,
-    resp: httpx.Response,
-    repo: str,
-    branch: str,
-    since_iso: str,
-    until_iso: str,
-    page: int,
+    client: httpx.Client, resp: httpx.Response, repo: str, branch: str,
+    since_iso: str, until_iso: str, page: int,
 ) -> httpx.Response:
     if resp.status_code != 403:
         return resp
@@ -158,30 +146,21 @@ def _handle_rate_limit(
     time.sleep(wait)
     retry = client.get(
         f"/repos/{repo}/commits",
-        params={
-            "sha": branch,
-            "since": since_iso,
-            "until": until_iso,
-            "per_page": 100,
-            "page": page,
-        },
+        params={"sha": branch, "since": since_iso, "until": until_iso,
+                "per_page": 100, "page": page},
     )
     return retry
 
 
 def _empty_detail() -> dict:
     return {
-        "additions": 0,
-        "deletions": 0,
-        "files_changed": 0,
-        "files": [],
-        "file_details": [],
-        "url": "",
+        "additions": 0, "deletions": 0, "files_changed": 0,
+        "files": [], "file_details": [], "patch_text": "", "url": "",
     }
 
 
 def _fetch_detail(client: httpx.Client, repo: str, sha: str) -> dict:
-    """Fetch commit stats and per-file change details (without patch body)."""
+    """抓 commit 详情：文件增删 + patch 文本。"""
 
     def _request() -> httpx.Response:
         resp = client.get(f"/repos/{repo}/commits/{sha}")
@@ -194,6 +173,9 @@ def _fetch_detail(client: httpx.Client, repo: str, sha: str) -> dict:
         raw_files = detail.get("files") or []
 
         file_details: list[FileChange] = []
+        patch_parts: list[str] = []
+        total_patch_len = 0
+
         for f in raw_files[:40]:
             name = str(f.get("filename") or "").strip()
             if not name:
@@ -206,6 +188,23 @@ def _fetch_detail(client: httpx.Client, repo: str, sha: str) -> dict:
                     deletions=int(f.get("deletions") or 0),
                 )
             )
+            # ⭐ 抓 patch（diff 文本）
+            patch = f.get("patch") or ""
+            if not patch:
+                continue
+            # 单个文件截断
+            if len(patch) > _MAX_PATCH_PER_FILE:
+                patch = patch[:_MAX_PATCH_PER_FILE] + "\n…（已截断）"
+            # 总量截断
+            remain = _MAX_PATCH_TOTAL - total_patch_len
+            if remain <= 0:
+                break
+            if len(patch) > remain:
+                patch = patch[:remain] + "\n…（已截断）"
+            patch_parts.append(f"--- {name} ---\n{patch}")
+            total_patch_len += len(patch)
+
+        patch_text = "\n\n".join(patch_parts)
 
         return {
             "additions": int(stats.get("additions") or 0),
@@ -213,6 +212,7 @@ def _fetch_detail(client: httpx.Client, repo: str, sha: str) -> dict:
             "files_changed": len(raw_files),
             "files": [fd.filename for fd in file_details],
             "file_details": file_details,
+            "patch_text": patch_text,
             "url": str(detail.get("html_url") or ""),
         }
     except Exception as exc:  # noqa: BLE001

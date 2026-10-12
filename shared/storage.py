@@ -1,39 +1,30 @@
-"""SQLite 日报历史存储。"""
+"""日报持久化（SQLite）。"""
 
 from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any
 
+from shared.logger import get_logger
 
-@dataclass
-class StoredReport:
-    id: int
-    report_date: date
-    team_name: str
-    markdown: str
-    html: str
-    generated_at: datetime
-    payload: dict[str, Any] | None = None
+logger = get_logger("daily_report.storage")
 
 
 class ReportStorage:
-    def __init__(self, db_path: str | Path) -> None:
+    """日报存储。表结构：
+
+    daily_reports(id, report_date, team_name, markdown, html, generated_at, payload_json)
+    """
+
+    def __init__(self, db_path: str | Path = "data/daily_reports.db"):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_db()
+        self._init_schema()
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
-
-    def _init_db(self) -> None:
-        with self._connect() as conn:
+    def _init_schema(self) -> None:
+        with sqlite3.connect(self.db_path) as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS daily_reports (
@@ -43,13 +34,13 @@ class ReportStorage:
                     markdown TEXT NOT NULL,
                     html TEXT NOT NULL,
                     generated_at TEXT NOT NULL,
-                    UNIQUE(report_date, team_name)
+                    payload_json TEXT
                 )
                 """
             )
-            cols = [r[1] for r in conn.execute("PRAGMA table_info(daily_reports)").fetchall()]
-            if "payload_json" not in cols:
-                conn.execute("ALTER TABLE daily_reports ADD COLUMN payload_json TEXT")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_report_date ON daily_reports(report_date)"
+            )
             conn.commit()
 
     def save(
@@ -58,23 +49,22 @@ class ReportStorage:
         team_name: str,
         markdown: str,
         html: str,
-        generated_at: datetime | None = None,
-        payload: dict[str, Any] | None = None,
+        generated_at: datetime,
+        payload: dict | None = None,
     ) -> int:
-        generated_at = generated_at or datetime.now()
+        """保存日报，返回 id。同一天重复保存会**覆盖**（保留最新一条）。"""
         payload_json = json.dumps(payload, ensure_ascii=False) if payload else None
-        with self._connect() as conn:
+        with sqlite3.connect(self.db_path) as conn:
+            # 如果当天已有，先删掉
             conn.execute(
+                "DELETE FROM daily_reports WHERE report_date = ?",
+                (report_date.isoformat(),),
+            )
+            cur = conn.execute(
                 """
-                INSERT INTO daily_reports (
-                    report_date, team_name, markdown, html, generated_at, payload_json
-                )
+                INSERT INTO daily_reports
+                    (report_date, team_name, markdown, html, generated_at, payload_json)
                 VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(report_date, team_name) DO UPDATE SET
-                    markdown=excluded.markdown,
-                    html=excluded.html,
-                    generated_at=excluded.generated_at,
-                    payload_json=excluded.payload_json
                 """,
                 (
                     report_date.isoformat(),
@@ -86,74 +76,54 @@ class ReportStorage:
                 ),
             )
             conn.commit()
-            row = conn.execute(
-                """
-                SELECT id FROM daily_reports
-                WHERE report_date = ? AND team_name = ?
-                """,
-                (report_date.isoformat(), team_name),
-            ).fetchone()
-            return int(row["id"]) if row else 0
+            return cur.lastrowid or 0
 
-    def get(self, report_date: date, team_name: str) -> StoredReport | None:
-        with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT id, report_date, team_name, markdown, html, generated_at, payload_json
-                FROM daily_reports
-                WHERE report_date = ? AND team_name = ?
-                """,
-                (report_date.isoformat(), team_name),
-            ).fetchone()
-        if row is None:
-            return None
-        return self._from_row(row)
-
-    def get_by_id(self, report_id: int) -> StoredReport | None:
-        with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT id, report_date, team_name, markdown, html, generated_at, payload_json
-                FROM daily_reports
-                WHERE id = ?
-                """,
-                (report_id,),
-            ).fetchone()
-        if row is None:
-            return None
-        return self._from_row(row)
-
-    def list_recent(self, limit: int = 30) -> list[StoredReport]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT id, report_date, team_name, markdown, html, generated_at, payload_json
-                FROM daily_reports
-                ORDER BY report_date DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
-        return [self._from_row(r) for r in rows]
-
-    def _from_row(self, row: sqlite3.Row) -> StoredReport:
-        raw = None
+    def get_payload_by_date(self, target_date: date) -> dict | None:
+        """读某天的 payload（含 sources / members 等）。没有返回 None。"""
         try:
-            raw = row["payload_json"]
-        except (KeyError, IndexError):
-            raw = None
-        payload = None
-        if raw:
-            try:
-                payload = json.loads(raw)
-            except json.JSONDecodeError:
-                payload = None
-        return StoredReport(
-            id=row["id"],
-            report_date=date.fromisoformat(row["report_date"]),
-            team_name=row["team_name"],
-            markdown=row["markdown"],
-            html=row["html"],
-            generated_at=datetime.fromisoformat(row["generated_at"]),
-            payload=payload,
-        )
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT payload_json FROM daily_reports
+                    WHERE report_date = ?
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (target_date.isoformat(),),
+                ).fetchone()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"读取 {target_date} 日报失败: {exc}")
+            return None
+
+        if not row or not row[0]:
+            return None
+        try:
+            return json.loads(row[0])
+        except Exception:  # noqa: BLE001
+            return None
+
+    def get_yesterday_stats(self, today: date) -> dict | None:
+        """读昨天的统计数据。没有返回 None。"""
+        yest = today - timedelta(days=1)
+        payload = self.get_payload_by_date(yest)
+        if not payload:
+            return None
+
+        commits = 0
+        files = 0
+        additions = 0
+        deletions = 0
+        for m in payload.get("members", []):
+            for c in m.get("commits", []):
+                commits += 1
+                files += int(c.get("files_changed", 0) or 0)
+                additions += int(c.get("additions", 0) or 0)
+                deletions += int(c.get("deletions", 0) or 0)
+        if commits == 0 and files == 0:
+            return None
+        return {
+            "date": yest.isoformat(),
+            "commits": commits,
+            "files": files,
+            "additions": additions,
+            "deletions": deletions,
+        }

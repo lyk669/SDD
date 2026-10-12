@@ -1,7 +1,7 @@
 """日报生成器 — 输出 Markdown + HTML。
 
-结构：概览 → 消息过滤 → 今日总结 → 新增/删除文件 → 仓库/成员/时间线（仅 commit）
-      → 💬 飞书群消息（独立区块）→ 📢 GitHub 公开活动 → 底部
+结构：概览 → 消息过滤 → 今日亮点 → 今日总结 → 群讨论要点
+      → 新增/删除文件 → commit 明细（含 diff 摘要）→ 群消息 → 底部
 """
 
 from __future__ import annotations
@@ -47,6 +47,37 @@ _STATUS_CN = {
 }
 
 _WEEKDAY_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+
+_COMMIT_TYPE_MAP = {
+    "feat": ("🆕", "新功能"), "feature": ("🆕", "新功能"),
+    "fix": ("🐛", "修复"), "bugfix": ("🐛", "修复"), "hotfix": ("🐛", "紧急修复"),
+    "docs": ("📝", "文档"), "doc": ("📝", "文档"),
+    "refactor": ("♻️", "重构"),
+    "test": ("🧪", "测试"), "tests": ("🧪", "测试"),
+    "chore": ("🔧", "杂项"),
+    "style": ("🎨", "样式"),
+    "perf": ("⚡", "性能"),
+    "ci": ("🚀", "CI"), "build": ("📦", "构建"),
+    "revert": ("⏪", "回滚"),
+}
+
+_ACTION_LABEL = {
+    "decision": ("✅", "决策"),
+    "todo": ("📌", "待办"),
+    "issue": ("⚠️", "问题"),
+}
+
+
+def _commit_type_tag(message: str) -> str:
+    if not message:
+        return ""
+    import re
+    m = message.strip().lower()
+    m = re.sub(r"^([a-z]+)\s*\([^)]*\)\s*:", r"\1:", m)
+    for prefix, (icon, cn) in _COMMIT_TYPE_MAP.items():
+        if m.startswith(prefix + ":") or m.startswith(prefix + " "):
+            return f"{icon} {cn}"
+    return ""
 
 
 def _file_icon(filename: str) -> str:
@@ -146,6 +177,27 @@ def _shorten(s: str, max_w: int = 30) -> str:
     return "".join(out)
 
 
+def _wrap_text(text: str, indent: str, width: int = 76) -> list[str]:
+    """按显示宽度折行，返回带缩进的行列表。"""
+    text = (text or "").strip()
+    if not text:
+        return []
+    lines = []
+    cur = indent
+    cur_w = _disp_width(indent)
+    for ch in text:
+        cw = 2 if ord(ch) > 0x2E80 else 1
+        if cur_w + cw > width:
+            lines.append(cur)
+            cur = indent
+            cur_w = _disp_width(indent)
+        cur += ch
+        cur_w += cw
+    if cur.strip():
+        lines.append(cur)
+    return lines
+
+
 def _collect_files_by_status(all_commits: list, target_statuses: set) -> list:
     seen: set = set()
     result: list = []
@@ -185,6 +237,17 @@ def _sort_messages(messages: list) -> list:
     )
 
 
+def _delta_str(cur: int, prev: int | None) -> str:
+    if prev is None:
+        return ""
+    diff = cur - prev
+    if diff == 0:
+        return "（较昨日 持平）"
+    if diff > 0:
+        return f"（较昨日 +{diff} ↑）"
+    return f"（较昨日 {diff} ↓）"
+
+
 # ---------- Markdown ----------
 
 def _render_markdown(
@@ -196,10 +259,18 @@ def _render_markdown(
     summary: str | None,
     generated_at: datetime,
     feishu_stats: dict | None = None,
+    yesterday_stats: dict | None = None,
+    highlights: list[str] | None = None,
+    action_items: list[dict] | None = None,
+    commit_summaries: dict[str, str] | None = None,
 ) -> str:
     events = events or []
     feishu_messages = feishu_messages or []
     feishu_stats = feishu_stats or {}
+    yesterday_stats = yesterday_stats or {}
+    highlights = highlights or []
+    action_items = action_items or []
+    commit_summaries = commit_summaries or {}
     summary = (summary or "").strip()
 
     all_commits = [c for m in members for c in (getattr(m, "commits", []) or [])]
@@ -229,16 +300,29 @@ def _render_markdown(
     skipped = int(feishu_stats.get("skipped", 0) or 0)
     total_msgs = int(feishu_stats.get("total", kept + skipped) or 0)
 
+    has_yest = bool(yesterday_stats)
+    y_commits = int(yesterday_stats.get("commits", 0)) if has_yest else None
+    y_files = int(yesterday_stats.get("files", 0)) if has_yest else None
+    y_add = int(yesterday_stats.get("additions", 0)) if has_yest else None
+    y_del = int(yesterday_stats.get("deletions", 0)) if has_yest else None
+    y_net = (y_add - y_del) if has_yest else None
+
     lines: list[str] = []
-    lines.append(f"# {team_name} 日报 — {report_date.isoformat()}（{weekday_cn}）")
+    lines.append(f"# {team_name} · {report_date.isoformat()}（{weekday_cn}）")
     lines.append("")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
     # 概览
     lines.append("📊 今日概览")
-    lines.append(f"  提交次数    {total_commits} 次")
-    lines.append(f"  涉及文件    {total_files} 个（新增 {added} · 修改 {modified} · 删除 {removed}）")
-    lines.append(f"  代码变更    +{total_add} / -{total_del}（净 {'+' if net >= 0 else ''}{net} 行）")
+    lines.append(f"  提交次数    {total_commits} 次{_delta_str(total_commits, y_commits)}")
+    lines.append(
+        f"  涉及文件    {total_files} 个（新增 {added} · 修改 {modified} · 删除 {removed}）"
+        f"{_delta_str(total_files, y_files)}"
+    )
+    lines.append(
+        f"  代码变更    +{total_add} / -{total_del}（净 {'+' if net >= 0 else ''}{net} 行）"
+        f"{_delta_str(net, y_net)}"
+    )
     lines.append(f"  覆盖仓库    {len(repos)} 个")
     if kept or skipped:
         senders = sorted({getattr(m, "sender_name", "") for m in feishu_messages
@@ -256,12 +340,29 @@ def _render_markdown(
         )
         lines.append("")
 
+    if highlights:
+        lines.append("⭐ 今日亮点")
+        for i, h in enumerate(highlights, 1):
+            lines.append(f"  {i}. {h}")
+        lines.append("")
+
     if summary:
         lines.append("📝 今日总结")
         for para in summary.split("\n"):
             para = para.strip()
             if para:
-                lines.append(f"  {para}")
+                for wl in _wrap_text(para, "  "):
+                    lines.append(wl)
+        lines.append("")
+
+    # 群讨论要点
+    if action_items:
+        lines.append("📌 群讨论要点")
+        for item in action_items:
+            icon, label = _ACTION_LABEL.get(item.get("type", ""), ("·", ""))
+            text = (item.get("text", "") or "").strip()
+            if text:
+                lines.append(f"  {icon} 【{label}】{text}")
         lines.append("")
 
     if new_files:
@@ -288,7 +389,6 @@ def _render_markdown(
 
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
-    # 仓库 → 成员 → 时间段 → commit 明细
     if total_commits > 0:
         for repo in repos or ["（未指定仓库）"]:
             repo_commits = [c for c in all_commits if getattr(c, "repo", "") == repo]
@@ -340,13 +440,19 @@ def _render_markdown(
                         idx += 1
                         full_ts = _fmt_datetime(getattr(c, "timestamp", None))
                         msg = (getattr(c, "message", "") or "").strip().splitlines()[0]
+                        tag = _commit_type_tag(msg)
+                        tag_str = f"  {tag}" if tag else ""
                         sha = _short_sha(getattr(c, "sha", ""))
                         additions = int(getattr(c, "additions", 0) or 0)
                         deletions = int(getattr(c, "deletions", 0) or 0)
                         url = _commit_link(c)
+                        ai_summary = commit_summaries.get(getattr(c, "sha", ""), "")
 
-                        lines.append(f"  {idx:02d}. {full_ts} · {msg}")
+                        lines.append(f"  {idx:02d}. {full_ts} · {msg}{tag_str}")
                         lines.append(f"      {sha}")
+                        if ai_summary:
+                            for wl in _wrap_text(ai_summary, "      💬 ", width=78):
+                                lines.append(wl)
                         lines.append("")
                         lines.append("      文件                              增 / 删           状态")
                         lines.append("      " + "─" * 56)
@@ -368,14 +474,13 @@ def _render_markdown(
                         lines.append(
                             f"      小计                              +{additions} / -{deletions}"
                         )
-                        lines.append("")
                         if url:
                             lines.append(f"      🔗 {url}")
                         lines.append("")
 
             lines.append("")
 
-    # ⭐ 飞书群消息 —— 独立区块
+    # 飞书群消息 —— 独立区块
     if feishu_messages:
         lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         lines.append(f"💬 飞书群消息（共 {len(feishu_messages)} 条）")
@@ -387,7 +492,6 @@ def _render_markdown(
             lines.append(f"  {ts}  {sender}：{text}")
         lines.append("")
 
-    # GitHub 公开活动
     if events:
         lines.append("─" * 58)
         lines.append("📢 今日 GitHub 公开活动")
@@ -419,10 +523,18 @@ def _render_html(
     summary: str | None,
     generated_at: datetime,
     feishu_stats: dict | None = None,
+    yesterday_stats: dict | None = None,
+    highlights: list[str] | None = None,
+    action_items: list[dict] | None = None,
+    commit_summaries: dict[str, str] | None = None,
 ) -> str:
     events = events or []
     feishu_messages = feishu_messages or []
     feishu_stats = feishu_stats or {}
+    yesterday_stats = yesterday_stats or {}
+    highlights = highlights or []
+    action_items = action_items or []
+    commit_summaries = commit_summaries or {}
     summary = (summary or "").strip()
 
     def esc(s) -> str:
@@ -455,14 +567,30 @@ def _render_html(
     skipped = int(feishu_stats.get("skipped", 0) or 0)
     total_msgs = int(feishu_stats.get("total", kept + skipped) or 0)
 
+    has_yest = bool(yesterday_stats)
+    y_commits = int(yesterday_stats.get("commits", 0)) if has_yest else None
+    y_files = int(yesterday_stats.get("files", 0)) if has_yest else None
+    y_add = int(yesterday_stats.get("additions", 0)) if has_yest else None
+    y_del = int(yesterday_stats.get("deletions", 0)) if has_yest else None
+    y_net = (y_add - y_del) if has_yest else None
+
+    def delta_html(cur, prev):
+        if prev is None:
+            return ""
+        diff = cur - prev
+        if diff == 0:
+            return "<span style='color:#999;font-size:12px;'>（较昨日 持平）</span>"
+        color = "#2e7d32" if diff > 0 else "#c62828"
+        arrow = "↑" if diff > 0 else "↓"
+        sign = "+" if diff > 0 else ""
+        return f"<span style='color:{color};font-size:12px;'>（较昨日 {sign}{diff} {arrow}）</span>"
+
     p: list[str] = []
-    p.append(
-        "<html><body style=\"font-family:-apple-system,'Segoe UI',Arial,"
-        "sans-serif;line-height:1.6;color:#222;max-width:900px;margin:0 auto;padding:16px;\">"
-    )
+    p.append("<html><body style=\"font-family:-apple-system,'Segoe UI',Arial,"
+             "sans-serif;line-height:1.6;color:#222;max-width:900px;margin:0 auto;padding:16px;\">")
     p.append(
         f"<h1 style='border-bottom:2px solid #4a6cf7;padding-bottom:8px;'>"
-        f"{esc(team_name)} 日报 — {esc(report_date.isoformat())}"
+        f"{esc(team_name)} · {esc(report_date.isoformat())}"
         f"<span style='font-size:15px;color:#666;font-weight:normal;'>"
         f"（{esc(weekday_cn)}）</span></h1>"
     )
@@ -471,20 +599,26 @@ def _render_html(
     p.append("<div style='background:#f0f3ff;border-radius:6px;padding:12px 16px;margin:12px 0;'>")
     p.append("<div style='font-weight:bold;margin-bottom:6px;'>📊 今日概览</div>")
     p.append("<table style='font-size:14px;'>")
-    p.append(f"<tr><td style='padding:2px 12px 2px 0;color:#666;'>提交次数</td><td><b>{total_commits}</b> 次</td></tr>")
-    p.append(f"<tr><td style='padding:2px 12px 2px 0;color:#666;'>涉及文件</td><td><b>{total_files}</b> 个（新增 {added} · 修改 {modified} · 删除 {removed}）</td></tr>")
+    p.append(f"<tr><td style='padding:2px 12px 2px 0;color:#666;'>提交次数</td>"
+             f"<td><b>{total_commits}</b> 次 {delta_html(total_commits, y_commits)}</td></tr>")
+    p.append(f"<tr><td style='padding:2px 12px 2px 0;color:#666;'>涉及文件</td>"
+             f"<td><b>{total_files}</b> 个（新增 {added} · 修改 {modified} · 删除 {removed}）"
+             f"{delta_html(total_files, y_files)}</td></tr>")
     p.append(f"<tr><td style='padding:2px 12px 2px 0;color:#666;'>代码变更</td><td>"
              f"<span style='color:#2e7d32;'>+{total_add}</span> / "
              f"<span style='color:#c62828;'>-{total_del}</span>"
-             f"（净 <b>{'+' if net >= 0 else ''}{net}</b> 行）</td></tr>")
-    p.append(f"<tr><td style='padding:2px 12px 2px 0;color:#666;'>覆盖仓库</td><td><b>{len(repos)}</b> 个</td></tr>")
+             f"（净 <b>{'+' if net >= 0 else ''}{net}</b> 行）"
+             f"{delta_html(net, y_net)}</td></tr>")
+    p.append(f"<tr><td style='padding:2px 12px 2px 0;color:#666;'>覆盖仓库</td>"
+             f"<td><b>{len(repos)}</b> 个</td></tr>")
     if kept or skipped:
         senders = sorted({getattr(m, "sender_name", "") for m in feishu_messages
                           if getattr(m, "sender_name", "")})
         msg_html = f"<b>{kept}</b> 条 · {len(senders)} 人参与"
         if skipped:
             msg_html += f"<span style='color:#999;'>（已过滤 {skipped} 条无效消息）</span>"
-        p.append(f"<tr><td style='padding:2px 12px 2px 0;color:#666;'>群消息</td><td>{msg_html}</td></tr>")
+        p.append(f"<tr><td style='padding:2px 12px 2px 0;color:#666;'>群消息</td>"
+                 f"<td>{msg_html}</td></tr>")
     p.append("</table></div>")
 
     if skipped:
@@ -497,17 +631,40 @@ def _render_html(
             "</div>"
         )
 
+    if highlights:
+        p.append("<div style='background:#eef4ff;border-left:4px solid #4a6cf7;"
+                 "border-radius:6px;padding:12px 16px;margin:12px 0;'>")
+        p.append("<div style='font-weight:bold;margin-bottom:6px;'>⭐ 今日亮点</div>")
+        p.append("<ol style='margin:4px 0;padding-left:24px;color:#333;'>")
+        for h in highlights:
+            p.append(f"<li style='margin:4px 0;'>{esc(h)}</li>")
+        p.append("</ol></div>")
+
     if summary:
-        p.append(
-            "<div style='background:#fff8e1;border-left:4px solid #f59e0b;"
-            "border-radius:6px;padding:12px 16px;margin:12px 0;'>"
-        )
+        p.append("<div style='background:#fff8e1;border-left:4px solid #f59e0b;"
+                 "border-radius:6px;padding:12px 16px;margin:12px 0;'>")
         p.append("<div style='font-weight:bold;margin-bottom:6px;'>📝 今日总结</div>")
         for para in summary.split("\n"):
             para = esc(para.strip())
             if para:
                 p.append(f"<p style='margin:4px 0;color:#333;'>{para}</p>")
         p.append("</div>")
+
+    # 群讨论要点
+    if action_items:
+        p.append("<div style='background:#f5f0ff;border-left:4px solid #8b5cf6;"
+                 "border-radius:6px;padding:12px 16px;margin:12px 0;'>")
+        p.append("<div style='font-weight:bold;margin-bottom:6px;'>📌 群讨论要点</div>")
+        p.append("<ul style='margin:4px 0;padding-left:20px;color:#333;list-style:none;'>")
+        for item in action_items:
+            icon, label = _ACTION_LABEL.get(item.get("type", ""), ("·", ""))
+            text = esc(item.get("text", "") or "")
+            if text:
+                p.append(
+                    f"<li style='margin:4px 0;'>{esc(icon)} "
+                    f"<b style='color:#8b5cf6;'>【{esc(label)}】</b>{text}</li>"
+                )
+        p.append("</ul></div>")
 
     if new_files:
         p.append("<div style='background:#eaf6ee;border-radius:6px;padding:12px 16px;margin:12px 0;'>")
@@ -539,7 +696,6 @@ def _render_html(
             )
         p.append("</table></div>")
 
-    # 仓库 / 成员 / 时间线（仅 commit）
     if total_commits > 0:
         for repo in repos or ["（未指定仓库）"]:
             repo_commits = [c for c in all_commits if getattr(c, "repo", "") == repo]
@@ -599,17 +755,33 @@ def _render_html(
                         idx += 1
                         full_ts = _fmt_datetime(getattr(c, "timestamp", None))
                         msg = esc((getattr(c, "message", "") or "").strip().splitlines()[0])
+                        tag = _commit_type_tag(getattr(c, "message", "") or "")
+                        tag_html = ""
+                        if tag:
+                            tag_html = (
+                                f" <span style='background:#eef4ff;color:#4a6cf7;"
+                                f"padding:1px 8px;border-radius:10px;font-size:12px;'>"
+                                f"{esc(tag)}</span>"
+                            )
                         sha = esc(_short_sha(getattr(c, "sha", "")))
                         additions = int(getattr(c, "additions", 0) or 0)
                         deletions = int(getattr(c, "deletions", 0) or 0)
                         url = _commit_link(c)
+                        ai_summary = commit_summaries.get(getattr(c, "sha", ""), "")
 
-                        p.append(
-                            "<div style='border-left:3px solid #4a6cf7;padding:10px 14px;"
-                            "margin:10px 0;background:#f8f9fc;border-radius:4px;'>"
-                        )
-                        p.append(f"<div><b>{idx:02d}. {full_ts} · {msg}</b></div>")
+                        p.append("<div style='border-left:3px solid #4a6cf7;padding:10px 14px;"
+                                 "margin:10px 0;background:#f8f9fc;border-radius:4px;'>")
+                        p.append(f"<div><b>{idx:02d}. {full_ts} · {msg}</b>{tag_html}</div>")
                         p.append(f"<div style='color:#888;font-size:13px;margin:4px 0;'><code>{sha}</code></div>")
+
+                        # ⭐ diff 摘要
+                        if ai_summary:
+                            p.append(
+                                "<div style='background:#eef4ff;border-left:3px solid #93b4ff;"
+                                "padding:6px 10px;margin:8px 0;border-radius:4px;"
+                                "font-size:13px;color:#333;'>"
+                                f"💬 {esc(ai_summary)}</div>"
+                            )
 
                         p.append("<table style='border-collapse:collapse;width:100%;font-size:13px;margin:6px 0;'>")
                         p.append(
@@ -651,17 +823,14 @@ def _render_html(
                             )
                         p.append("</div>")
 
-    # ⭐ 飞书群消息 —— 独立区块
     if feishu_messages:
         p.append("<hr style='border:none;border-top:1px solid #eee;margin:24px 0;'>")
         p.append(
             f"<h2 style='color:#10b981;margin-top:0;'>"
             f"💬 飞书群消息（共 {len(feishu_messages)} 条）</h2>"
         )
-        p.append(
-            "<div style='background:#f0fdf4;border-radius:6px;"
-            "padding:10px 14px;font-size:14px;'>"
-        )
+        p.append("<div style='background:#f0fdf4;border-radius:6px;"
+                 "padding:10px 14px;font-size:14px;'>")
         for msg in _sort_messages(feishu_messages):
             ts = _fmt_time(getattr(msg, "timestamp", None))
             sender = esc(getattr(msg, "sender_name", "") or "未知")
@@ -684,10 +853,8 @@ def _render_html(
             s_text = esc(getattr(e, "summary", ""))
             url = getattr(e, "url", "") or ""
             if url:
-                p.append(
-                    f"<li><code>{esc(ts)}</code> "
-                    f"<a href='{esc(url)}' style='color:#4a6cf7;'>{s_text}</a></li>"
-                )
+                p.append(f"<li><code>{esc(ts)}</code> "
+                         f"<a href='{esc(url)}' style='color:#4a6cf7;'>{s_text}</a></li>")
             else:
                 p.append(f"<li><code>{esc(ts)}</code> {s_text}</li>")
         p.append("</ul>")
@@ -713,16 +880,21 @@ def generate(
     summary: str | None = None,
     generated_at: datetime | None = None,
     feishu_stats: dict | None = None,
+    yesterday_stats: dict | None = None,
+    highlights: list[str] | None = None,
+    action_items: list[dict] | None = None,          # ⭐ 新增
+    commit_summaries: dict[str, str] | None = None,   # ⭐ 新增
 ) -> Report:
-    """生成日报对象（Markdown + HTML）。"""
     generated_at = generated_at or datetime.now()
     md = _render_markdown(
         members, report_date, team_name, events, feishu_messages,
-        summary, generated_at, feishu_stats,
+        summary, generated_at, feishu_stats, yesterday_stats, highlights,
+        action_items, commit_summaries,
     )
     html = _render_html(
         members, report_date, team_name, events, feishu_messages,
-        summary, generated_at, feishu_stats,
+        summary, generated_at, feishu_stats, yesterday_stats, highlights,
+        action_items, commit_summaries,
     )
     return Report(
         date=report_date,

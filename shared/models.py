@@ -31,11 +31,11 @@ class CommitRecord:
     files: list[str] = field(default_factory=list)
     url: str = ""
     file_details: list[FileChange] = field(default_factory=list)
+    patch_text: str = ""              # ⭐ 新增：diff 文本（供 LLM 读）
 
 
 @dataclass
 class EventRecord:
-    """GitHub 公开活动（Events API）。"""
     actor: str
     event_type: str
     repo: str
@@ -46,7 +46,6 @@ class EventRecord:
 
 @dataclass
 class MessageRecord:
-    """飞书群消息。"""
     sender_id: str
     sender_name: str
     chat_id: str
@@ -66,16 +65,10 @@ class TaskRecord:
 
 @dataclass
 class CollectResult(Generic[T]):
-    """采集层统一返回封装（ADR-003）。
-
-    success=True 且 records=[]  → 今日无记录
-    success=False              → 数据获取失败
-    """
-
     success: bool
     records: list[T] = field(default_factory=list)
     error_message: str | None = None
-    meta: dict = field(default_factory=dict)     # ← 新增：附加统计信息
+    meta: dict = field(default_factory=dict)
 
 
 @dataclass

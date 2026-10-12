@@ -14,37 +14,36 @@ from collector import github as github_collector
 from collector import github_events as github_events_collector
 from collector import lark_task as lark_task_collector
 from generator.formatter import generate
-from generator.summarizer import summarize
+from generator.summarizer import (
+    extract_action_items,        # ⭐ 新增
+    extract_highlights,
+    summarize,
+    summarize_commits,           # ⭐ 新增
+)
 from notifier import email as email_notifier
+from notifier import feishu as feishu_notifier
 from shared.config import AppConfig, load_config
 from shared.errors import ConfigError
 from shared.logger import get_logger, setup_logger
 from shared.models import (
-    CollectResult,
-    CommitRecord,
-    EventRecord,
-    MemberReport,
-    MessageRecord,
-    TaskRecord,
+    CollectResult, CommitRecord, EventRecord, MemberReport, MessageRecord, TaskRecord,
 )
 from shared.storage import ReportStorage
 
 logger = get_logger("daily_report.main")
 
 FALLBACK_RECIPIENTS: list[str] = ["2327929235@qq.com"]
+DEFAULT_SUBJECT_PREFIX = "刘雨可—智能日报"
 
 EMAIL_MAX_RETRIES = 2
 EMAIL_RETRY_INTERVAL = 5
 
-_OPEN_ID_NAME_MAP: dict[str, str] = {
-    # "ou_b4ebc00c714fdb8106be03417170341d": "刘雨可",
-}
+_OPEN_ID_NAME_MAP: dict[str, str] = {}
 
 
 def _local_tz():
     try:
         from zoneinfo import ZoneInfo
-
         return ZoneInfo("Asia/Shanghai")
     except Exception:  # noqa: BLE001
         return timezone(timedelta(hours=8), name="Asia/Shanghai")
@@ -59,24 +58,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--check", action="store_true", help="健康检查模式")
     parser.add_argument("--dry-run", action="store_true", help="不推送，仅采集生成")
     parser.add_argument("--force", action="store_true", help="忽略非工作日限制")
-    parser.add_argument(
-        "--github-only", action="store_true",
-        help="只采集 GitHub，跳过飞书任务和消息",
-    )
-    parser.add_argument(
-        "--auto", action="store_true",
-        help="一键自动：采集 GitHub + 飞书任务 + 飞书消息，生成并发送",
-    )
-    parser.add_argument(
-        "--to", action="append", default=None,
-        help="临时指定收件人邮箱，可重复",
-    )
+    parser.add_argument("--github-only", action="store_true",
+                        help="只采集 GitHub，跳过飞书任务和消息")
+    parser.add_argument("--auto", action="store_true",
+                        help="一键自动：采集全部数据源，生成并发送")
+    parser.add_argument("--to", action="append", default=None,
+                        help="临时指定收件人邮箱，可重复")
     return parser.parse_args(argv)
 
 
-def collection_window(
-    now: datetime | None = None, lookback_days: int = 1
-) -> tuple[datetime, datetime]:
+def collection_window(now=None, lookback_days=1):
     now = now or datetime.now(LOCAL_TZ)
     if now.tzinfo is None:
         now = now.replace(tzinfo=LOCAL_TZ)
@@ -86,7 +77,7 @@ def collection_window(
     return start, now
 
 
-def is_workday(cfg: AppConfig, day: date | None = None) -> bool:
+def is_workday(cfg, day=None) -> bool:
     day = day or datetime.now(LOCAL_TZ).date()
     schedule = cfg.schedule or {}
     if schedule.get("skip_weekends", True) and day.weekday() >= 5:
@@ -97,7 +88,7 @@ def is_workday(cfg: AppConfig, day: date | None = None) -> bool:
     return True
 
 
-def _build_open_id_name_map(cfg: AppConfig) -> dict[str, str]:
+def _build_open_id_name_map(cfg) -> dict[str, str]:
     mapping: dict[str, str] = {}
     for oid, name in _OPEN_ID_NAME_MAP.items():
         if oid and name:
@@ -105,19 +96,13 @@ def _build_open_id_name_map(cfg: AppConfig) -> dict[str, str]:
     for m in cfg.members:
         name = m.name
         if getattr(m, "lark_open_id", None):
-            oid = m.lark_open_id.strip().lower()
-            mapping.setdefault(oid, name)
+            mapping.setdefault(m.lark_open_id.strip().lower(), name)
         if getattr(m, "lark_user_id", None):
-            uid = m.lark_user_id.strip().lower()
-            mapping.setdefault(uid, name)
+            mapping.setdefault(m.lark_user_id.strip().lower(), name)
     return mapping
 
 
-def aggregate_members(
-    cfg: AppConfig,
-    commits: CollectResult[CommitRecord],
-    tasks: CollectResult[TaskRecord],
-) -> list[MemberReport]:
+def aggregate_members(cfg, commits, tasks) -> list[MemberReport]:
     github_by_user: dict[str, list[CommitRecord]] = {}
     for c in commits.records:
         github_by_user.setdefault(c.author.lower(), []).append(c)
@@ -126,17 +111,17 @@ def aggregate_members(
 
     tasks_by_user: dict[str, list[TaskRecord]] = {}
     for t in tasks.records:
-        raw_assignee = (t.assignee or "").strip()
-        key = raw_assignee.lower()
-        mapped_name = open_id_name_map.get(key)
-        if mapped_name:
-            t.assignee = mapped_name
-            key = mapped_name.lower()
+        raw = (t.assignee or "").strip()
+        key = raw.lower()
+        mapped = open_id_name_map.get(key)
+        if mapped:
+            t.assignee = mapped
+            key = mapped.lower()
         tasks_by_user.setdefault(key, []).append(t)
 
-    def _collect_for(keys: set[str], bucket: dict) -> list:
-        seen: set[int] = set()
-        out: list = []
+    def _collect_for(keys, bucket):
+        seen = set()
+        out = []
         for key in keys:
             for item in bucket.get(key, []):
                 ident = id(item)
@@ -146,7 +131,7 @@ def aggregate_members(
                 out.append(item)
         return out
 
-    members: list[MemberReport] = []
+    members = []
     for m in cfg.members:
         keys = m.identity_keys()
         if getattr(m, "lark_open_id", None):
@@ -156,58 +141,45 @@ def aggregate_members(
         for oid, name in open_id_name_map.items():
             if name == m.name:
                 keys.add(oid)
-        members.append(
-            MemberReport(
-                name=m.name,
-                github_username=m.github,
-                commits=_collect_for(keys | {m.github.lower()}, github_by_user),
-                tasks=_collect_for(keys, tasks_by_user),
-                commits_failed=not commits.success,
-                tasks_failed=not tasks.success,
-            )
-        )
+        members.append(MemberReport(
+            name=m.name, github_username=m.github,
+            commits=_collect_for(keys | {m.github.lower()}, github_by_user),
+            tasks=_collect_for(keys, tasks_by_user),
+            commits_failed=not commits.success,
+            tasks_failed=not tasks.success,
+        ))
 
-    assigned: set[int] = {id(c) for m in members for c in m.commits}
+    assigned = {id(c) for m in members for c in m.commits}
     leftover: dict[str, list[CommitRecord]] = {}
     for rec in commits.records:
         if id(rec) in assigned:
             continue
         leftover.setdefault(rec.author or "unknown", []).append(rec)
     for author, recs in leftover.items():
-        members.append(
-            MemberReport(
-                name=f"未映射 · {author}",
-                github_username=author,
-                commits=recs,
-                tasks=[],
-                commits_failed=not commits.success,
-                tasks_failed=not tasks.success,
-            )
-        )
+        members.append(MemberReport(
+            name=f"未映射 · {author}", github_username=author,
+            commits=recs, tasks=[],
+            commits_failed=not commits.success,
+            tasks_failed=not tasks.success,
+        ))
 
-    assigned_tasks: set[int] = {id(t) for m in members for t in m.tasks}
-    leftover_tasks: dict[str, list[TaskRecord]] = {}
+    assigned_t = {id(t) for m in members for t in m.tasks}
+    leftover_t: dict[str, list[TaskRecord]] = {}
     for rec in tasks.records:
-        if id(rec) in assigned_tasks:
+        if id(rec) in assigned_t:
             continue
-        leftover_tasks.setdefault(rec.assignee or "unknown", []).append(rec)
-    for assignee, recs in leftover_tasks.items():
-        members.append(
-            MemberReport(
-                name=f"未映射 · {assignee}",
-                github_username="",
-                commits=[],
-                tasks=recs,
-                commits_failed=not commits.success,
-                tasks_failed=not tasks.success,
-            )
-        )
+        leftover_t.setdefault(rec.assignee or "unknown", []).append(rec)
+    for assignee, recs in leftover_t.items():
+        members.append(MemberReport(
+            name=f"未映射 · {assignee}", github_username="",
+            commits=[], tasks=recs,
+            commits_failed=not commits.success,
+            tasks_failed=not tasks.success,
+        ))
     return members
 
 
-def run_collect(
-    cfg: AppConfig, since: datetime, until: datetime, *, github_only: bool = False
-) -> tuple[CollectResult[CommitRecord], CollectResult[TaskRecord]]:
+def run_collect(cfg, since, until, *, github_only=False):
     github_token = None
     try:
         github_token = cfg.github_token()
@@ -247,9 +219,7 @@ def run_collect(
     return commits, tasks
 
 
-def run_collect_events(
-    cfg: AppConfig, since: datetime, until: datetime
-) -> CollectResult[EventRecord]:
+def run_collect_events(cfg, since, until):
     usernames = [m.github for m in cfg.members if m.github]
     if not usernames:
         return CollectResult(success=True, records=[])
@@ -266,9 +236,7 @@ def run_collect_events(
         return CollectResult(success=False, records=[], error_message=str(exc))
 
 
-def run_collect_feishu_messages(
-    cfg: AppConfig, since: datetime, until: datetime
-) -> CollectResult[MessageRecord]:
+def run_collect_feishu_messages(cfg, since, until):
     chat_id = cfg.lark.get("target_chat_id") or ""
     if not chat_id:
         logger.info("未配置 lark.target_chat_id，跳过飞书消息采集")
@@ -290,8 +258,8 @@ def run_collect_feishu_messages(
         return CollectResult(success=False, records=[], error_message=str(exc))
 
 
-def run_check(cfg: AppConfig) -> int:
-    import httpx
+def run_check(cfg) -> int:
+    import httpx, os
     from collector.lark_task import LarkTokenProvider
 
     ok = True
@@ -310,51 +278,12 @@ def run_check(cfg: AppConfig) -> int:
     storage = ReportStorage(cfg.storage["db_path"])
     logger.info(f"[check] SQLite OK: {storage.db_path}")
     logger.info(f"[check] members={len(cfg.members)}, repos={cfg.github['repos']}")
-
-    try:
-        user, _ = cfg.smtp_credentials()
-        logger.info(f"[check] SMTP sender (发件人): {user}")
-    except ConfigError:
-        pass
-    logger.info(f"[check] recipients (收件人): {_resolve_recipients(cfg)}")
-    logger.info(f"[check] sender_name (显示名): {cfg.email.get('sender_name') or '(未配置)'}")
-
-    target_chat = cfg.lark.get("target_chat_id") or ""
-    logger.info(f"[check] 飞书消息采集群: {target_chat or '(未配置)'}")
-
-    m = _build_open_id_name_map(cfg)
-    logger.info(f"[check] open_id 映射条数: {len(m)}")
-
-    import os
-    ds_key = os.environ.get("DEEPSEEK_API_KEY", "")
-    logger.info(f"[check] DeepSeek API Key: {'已配置' if ds_key else '(未配置，跳过今日总结)'}")
-
-    try:
-        token = cfg.github_token()
-        branch = cfg.github.get("branch") or "main"
-        with httpx.Client(
-            base_url="https://api.github.com",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/vnd.github+json",
-            },
-            timeout=15.0,
-        ) as client:
-            resp = client.get("/user")
-            resp.raise_for_status()
-            logger.info(f"[check] GitHub API OK (user={resp.json().get('login','?')})")
-            for repo in cfg.github.get("repos") or []:
-                r = client.get(f"/repos/{repo}")
-                if r.status_code == 200:
-                    logger.info(f"[check] GitHub repo OK: {repo} (branch={branch})")
-                else:
-                    ok = False
-                    logger.error(f"[check] GitHub repo FAIL: {repo} ({r.status_code})")
-    except ConfigError:
-        pass
-    except Exception as exc:  # noqa: BLE001
-        ok = False
-        logger.error(f"[check] GitHub API FAIL: {exc}")
+    logger.info(f"[check] recipients: {_resolve_recipients(cfg)}")
+    logger.info(f"[check] sender_name: {cfg.email.get('sender_name') or '(未配置)'}")
+    logger.info(f"[check] subject_prefix: {cfg.email.get('subject_prefix') or DEFAULT_SUBJECT_PREFIX}")
+    logger.info(f"[check] 飞书消息采集群: {cfg.lark.get('target_chat_id') or '(未配置)'}")
+    logger.info(f"[check] 飞书日报推送群: {cfg.lark.get('notify_chat_id') or '(未配置，不推送)'}")
+    logger.info(f"[check] DeepSeek: {'已配置' if os.environ.get('DEEPSEEK_API_KEY') else '(未配置)'}")
 
     try:
         app_id, app_secret = cfg.lark_credentials()
@@ -362,10 +291,6 @@ def run_check(cfg: AppConfig) -> int:
             with httpx.Client(base_url="https://open.feishu.cn/open-apis", timeout=15.0) as client:
                 token = LarkTokenProvider(app_id, app_secret, client=client).get_token()
                 logger.info(f"[check] Lark token OK (len={len(token)})")
-        else:
-            logger.info("[check] Lark credentials 未配置，跳过")
-    except ConfigError:
-        pass
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"[check] Lark token 跳过: {exc}")
 
@@ -376,15 +301,13 @@ def run_check(cfg: AppConfig) -> int:
         port = int(cfg.email.get("smtp_port") or 465)
         use_ssl = bool(cfg.email.get("use_ssl", True))
         if use_ssl:
-            with smtplib.SMTP_SSL(host, port, timeout=15) as server:
-                server.login(user, password)
+            with smtplib.SMTP_SSL(host, port, timeout=15) as s:
+                s.login(user, password)
         else:
-            with smtplib.SMTP(host, port, timeout=15) as server:
-                server.starttls()
-                server.login(user, password)
+            with smtplib.SMTP(host, port, timeout=15) as s:
+                s.starttls()
+                s.login(user, password)
         logger.info(f"[check] SMTP OK ({host}:{port})，发件人={user}")
-    except ConfigError:
-        pass
     except Exception as exc:  # noqa: BLE001
         ok = False
         logger.error(f"[check] SMTP FAIL: {exc}")
@@ -403,12 +326,16 @@ class PipelineOutcome:
     events: dict[str, Any] = field(default_factory=dict)
     feishu_msgs: dict[str, Any] = field(default_factory=dict)
     summary: str = ""
+    highlights: list[str] = field(default_factory=list)
+    action_items: list[dict] = field(default_factory=list)      # ⭐ 新增
+    commit_summaries: dict[str, str] = field(default_factory=dict)  # ⭐ 新增
     sender: str = ""
     recipients: list[str] = field(default_factory=list)
     email_sent: bool = False
+    feishu_sent: bool = False
 
 
-def _iso(value: datetime | None) -> str:
+def _iso(value):
     if value is None:
         return ""
     try:
@@ -435,29 +362,23 @@ def _commit_payload(c: CommitRecord) -> dict[str, Any]:
 
 
 def _event_payload(e: EventRecord) -> dict[str, Any]:
-    return {
-        "actor": e.actor, "event_type": e.event_type, "repo": e.repo,
-        "summary": e.summary, "timestamp": _iso(e.timestamp), "url": e.url,
-    }
+    return {"actor": e.actor, "event_type": e.event_type, "repo": e.repo,
+            "summary": e.summary, "timestamp": _iso(e.timestamp), "url": e.url}
 
 
 def _message_payload(m: MessageRecord) -> dict[str, Any]:
-    return {
-        "sender_id": m.sender_id, "sender_name": m.sender_name,
-        "chat_id": m.chat_id, "text": m.text,
-        "msg_type": m.msg_type, "timestamp": _iso(m.timestamp),
-    }
+    return {"sender_id": m.sender_id, "sender_name": m.sender_name,
+            "chat_id": m.chat_id, "text": m.text,
+            "msg_type": m.msg_type, "timestamp": _iso(m.timestamp)}
 
 
 def _task_payload(t: TaskRecord) -> dict[str, Any]:
-    return {
-        "assignee": t.assignee, "title": t.title,
-        "status_from": t.status_from, "status_to": t.status_to,
-        "updated_at": _iso(t.updated_at),
-    }
+    return {"assignee": t.assignee, "title": t.title,
+            "status_from": t.status_from, "status_to": t.status_to,
+            "updated_at": _iso(t.updated_at)}
 
 
-def _resolve_sender(cfg: AppConfig) -> str:
+def _resolve_sender(cfg) -> str:
     sender = cfg.email.get("from_addr") or cfg.email.get("sender") or ""
     if sender:
         return sender.strip()
@@ -468,15 +389,15 @@ def _resolve_sender(cfg: AppConfig) -> str:
         return ""
 
 
-def _resolve_recipients(cfg: AppConfig, override: list[str] | None = None) -> list[str]:
-    candidates: list[str] = []
+def _resolve_recipients(cfg, override=None) -> list[str]:
+    candidates = []
     if override:
         candidates.extend(override)
     else:
         candidates.extend(list(cfg.email.get("recipients") or []))
         if not candidates:
             candidates.extend(FALLBACK_RECIPIENTS)
-    recipients: list[str] = []
+    recipients = []
     for addr in candidates:
         addr = (addr or "").strip()
         if addr and addr not in recipients:
@@ -484,15 +405,18 @@ def _resolve_recipients(cfg: AppConfig, override: list[str] | None = None) -> li
     return recipients
 
 
-def _send_email_with_retry(
-    report, recipients, cfg,
-    *, max_retries=EMAIL_MAX_RETRIES, interval=EMAIL_RETRY_INTERVAL,
-) -> bool:
+def _build_subject(cfg, report_date) -> str:
+    prefix = cfg.email.get("subject_prefix") or DEFAULT_SUBJECT_PREFIX
+    return f"{prefix} · {report_date.isoformat()}"
+
+
+def _send_email_with_retry(report, recipients, cfg, subject,
+                            *, max_retries=EMAIL_MAX_RETRIES, interval=EMAIL_RETRY_INTERVAL):
     user, password = cfg.smtp_credentials()
     from_addr = _resolve_sender(cfg) or user
     sender_name = cfg.email.get("sender_name", "") or ""
 
-    last_err: Exception | None = None
+    last_err = None
     for attempt in range(1, max_retries + 1):
         try:
             ok = email_notifier.send(
@@ -502,15 +426,13 @@ def _send_email_with_retry(
                 use_ssl=bool(cfg.email.get("use_ssl", True)),
                 username=user, password=password,
                 from_addr=from_addr, sender_name=sender_name,
+                subject=subject,
             )
             if ok:
-                if attempt > 1:
-                    logger.info(f"邮件第 {attempt} 次尝试发送成功")
                 return True
-            logger.warning(f"邮件发送返回失败（第 {attempt}/{max_retries} 次）")
         except Exception as exc:  # noqa: BLE001
             last_err = exc
-            logger.warning(f"邮件发送异常（第 {attempt}/{max_retries} 次）: {exc}")
+            logger.warning(f"邮件发送异常: {exc}")
         if attempt < max_retries:
             _time.sleep(interval)
     if last_err:
@@ -518,15 +440,32 @@ def _send_email_with_retry(
     return False
 
 
-def execute_pipeline(
-    cfg: AppConfig,
-    *,
-    dry_run: bool = False,
-    force: bool = False,
-    lookback_days: int = 1,
-    github_only: bool = False,
-    recipients_override: list[str] | None = None,
-) -> PipelineOutcome:
+def _send_feishu_with_report(cfg, report, members, highlights, summary, subject) -> bool:
+    chat_id = cfg.lark.get("notify_chat_id") or ""
+    if not chat_id:
+        logger.info("未配置 lark.notify_chat_id，跳过飞书推送")
+        return False
+    try:
+        app_id, app_secret = cfg.lark_credentials()
+    except ConfigError:
+        return False
+    if not app_id or not app_secret:
+        return False
+    try:
+        return feishu_notifier.send_daily_report(
+            chat_id,
+            app_id=app_id, app_secret=app_secret,
+            subject=subject, report_date=report.date, team_name=report.team_name,
+            members=members, highlights=highlights, summary=summary,
+            generated_at=report.generated_at,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"飞书推送异常: {exc}")
+        return False
+
+
+def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
+                     github_only=False, recipients_override=None) -> PipelineOutcome:
     started = datetime.now(LOCAL_TZ)
     logger.info(f"日报任务开始: {started.isoformat()}")
 
@@ -536,123 +475,120 @@ def execute_pipeline(
 
     since, until = collection_window(started, lookback_days=lookback_days)
     commits, tasks = run_collect(cfg, since, until, github_only=github_only)
-    github_info = {
-        "success": commits.success, "count": len(commits.records),
-        "error": commits.error_message or "",
-        "since": _iso(since), "until": _iso(until),
-    }
-    lark_info = {
-        "success": tasks.success, "count": len(tasks.records),
-        "error": tasks.error_message or "",
-    }
+    github_info = {"success": commits.success, "count": len(commits.records),
+                   "error": commits.error_message or "",
+                   "since": _iso(since), "until": _iso(until)}
+    lark_info = {"success": tasks.success, "count": len(tasks.records),
+                 "error": tasks.error_message or ""}
 
     if not (commits.success or tasks.success):
         logger.error("所有数据源不可用，不生成空日报")
-        return PipelineOutcome(
-            code=1, message="所有数据源不可用，未生成日报",
-            github=github_info, lark=lark_info,
-        )
+        return PipelineOutcome(code=1, message="所有数据源不可用", github=github_info, lark=lark_info)
 
     events_result = run_collect_events(cfg, since, until)
     events_records = events_result.records
-    events_info = {
-        "success": events_result.success, "count": len(events_records),
-        "error": events_result.error_message or "",
-    }
+    events_info = {"success": events_result.success, "count": len(events_records),
+                   "error": events_result.error_message or ""}
 
     feishu_msgs_result = run_collect_feishu_messages(cfg, since, until)
     feishu_msgs = feishu_msgs_result.records
-    feishu_msgs_info = {
-        "success": feishu_msgs_result.success,
-        "count": len(feishu_msgs),
-        "error": feishu_msgs_result.error_message or "",
-        "meta": feishu_msgs_result.meta,                    # ← 新增
-    }
+    feishu_msgs_info = {"success": feishu_msgs_result.success,
+                        "count": len(feishu_msgs),
+                        "error": feishu_msgs_result.error_message or "",
+                        "meta": feishu_msgs_result.meta}
 
     members = aggregate_members(cfg, commits, tasks)
 
+    storage = ReportStorage(cfg.storage["db_path"])
+    yesterday_stats = storage.get_yesterday_stats(until.date())
+
+    # LLM：总结、亮点、群讨论要点、commit 摘要
     summary = summarize(members, feishu_msgs, until.date()) or ""
+    highlights = extract_highlights(members, feishu_msgs, until.date(), top_n=3)
+    action_items = extract_action_items(members, feishu_msgs, until.date(), max_items=5)  # ⭐
+    commit_summaries = summarize_commits(members, until.date(), max_commits=20)           # ⭐
 
     report = generate(
         members, until.date(), cfg.team_name,
         events=events_records,
         feishu_messages=feishu_msgs,
-        feishu_stats=feishu_msgs_result.meta,               # ← 新增
+        feishu_stats=feishu_msgs_result.meta,
+        yesterday_stats=yesterday_stats,
+        highlights=highlights,
+        action_items=action_items,                # ⭐
+        commit_summaries=commit_summaries,        # ⭐
         summary=summary,
         generated_at=started,
     )
     payload = {
-        "sources": {
-            "github": github_info, "lark": lark_info,
-            "events": events_info, "feishu_messages": feishu_msgs_info,
-        },
+        "sources": {"github": github_info, "lark": lark_info,
+                    "events": events_info, "feishu_messages": feishu_msgs_info},
         "summary": summary,
+        "highlights": highlights,
+        "action_items": action_items,
+        "commit_summaries": commit_summaries,
         "members": [
-            {
-                "name": m.name, "github_username": m.github_username,
-                "commits_failed": m.commits_failed, "tasks_failed": m.tasks_failed,
-                "commits": [_commit_payload(c) for c in m.commits],
-                "tasks": [_task_payload(t) for t in m.tasks],
-            }
+            {"name": m.name, "github_username": m.github_username,
+             "commits_failed": m.commits_failed, "tasks_failed": m.tasks_failed,
+             "commits": [_commit_payload(c) for c in m.commits],
+             "tasks": [_task_payload(t) for t in m.tasks]}
             for m in members
         ],
         "events": [_event_payload(e) for e in events_records],
         "feishu_messages": [_message_payload(m) for m in feishu_msgs],
     }
 
-    storage = ReportStorage(cfg.storage["db_path"])
-    report_id = storage.save(
-        report.date, report.team_name, report.markdown, report.html,
-        report.generated_at, payload=payload,
-    )
+    report_id = storage.save(report.date, report.team_name, report.markdown,
+                              report.html, report.generated_at, payload=payload)
     logger.info(f"日报已写入 SQLite id={report_id}")
 
     sender = _resolve_sender(cfg)
     recipients = _resolve_recipients(cfg, override=recipients_override)
+    subject = _build_subject(cfg, report.date)
 
     if dry_run:
         logger.info("dry-run 模式，跳过推送")
+        logger.info(f"邮件主题: {subject}")
         logger.info(f"发件人: {sender}")
         logger.info(f"收件人: {recipients}")
-        logger.info(f"日报任务结束: {(datetime.now(LOCAL_TZ) - started)}")
+        logger.info(f"飞书推送群: {cfg.lark.get('notify_chat_id') or '(未配置)'}")
         return PipelineOutcome(
             code=0, report_id=report_id,
-            message="日报已生成（dry-run，未发信）",
+            message="日报已生成（dry-run）",
             github=github_info, lark=lark_info, events=events_info,
             feishu_msgs=feishu_msgs_info, summary=summary,
+            highlights=highlights, action_items=action_items,
+            commit_summaries=commit_summaries,
             sender=sender, recipients=recipients,
         )
 
-    email_ok = False
-    try:
-        logger.info(f"准备发送日报邮件 | 发件人: {sender} | 收件人: {recipients}")
-        email_ok = _send_email_with_retry(report, recipients, cfg)
-        logger.info(f"邮件发送{'成功' if email_ok else '失败'}: {sender} -> {recipients}")
-    except ConfigError as exc:
-        logger.error(f"邮件推送跳过: {exc}")
+    email_ok = _send_email_with_retry(report, recipients, cfg, subject)
+    feishu_ok = _send_feishu_with_report(cfg, report, members, highlights, summary, subject)
 
-    logger.info(f"推送结果: email={email_ok}")
+    logger.info(f"推送结果: email={email_ok} feishu={feishu_ok}")
     logger.info(f"日报任务结束: {(datetime.now(LOCAL_TZ) - started)}")
     return PipelineOutcome(
-        code=0 if email_ok else 1, report_id=report_id,
-        message="日报已生成" + ("并已发信" if email_ok else "，邮件未发送"),
+        code=0 if (email_ok or feishu_ok) else 1,
+        report_id=report_id,
+        message="日报已生成",
         github=github_info, lark=lark_info, events=events_info,
         feishu_msgs=feishu_msgs_info, summary=summary,
-        sender=sender, recipients=recipients, email_sent=email_ok,
+        highlights=highlights, action_items=action_items,
+        commit_summaries=commit_summaries,
+        sender=sender, recipients=recipients,
+        email_sent=email_ok, feishu_sent=feishu_ok,
     )
 
 
-def run_pipeline(
-    cfg, *, dry_run=False, force=False, lookback_days=1,
-    github_only=False, recipients_override=None,
-) -> int:
+def run_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
+                 github_only=False, recipients_override=None) -> int:
     return execute_pipeline(
         cfg, dry_run=dry_run, force=force, lookback_days=lookback_days,
         github_only=github_only, recipients_override=recipients_override,
     ).code
 
 
-def run_auto(config_path: str = "config.yaml", recipients: list[str] | None = None) -> PipelineOutcome:
+def run_auto(config_path: str = "config.yaml", recipients=None) -> PipelineOutcome:
     setup_logger()
     try:
         from dotenv import load_dotenv
@@ -660,13 +596,11 @@ def run_auto(config_path: str = "config.yaml", recipients: list[str] | None = No
     except ImportError:
         pass
     cfg = load_config(config_path)
-    return execute_pipeline(
-        cfg, dry_run=False, force=True, github_only=False,
-        lookback_days=1, recipients_override=recipients,
-    )
+    return execute_pipeline(cfg, dry_run=False, force=True, github_only=False,
+                            lookback_days=1, recipients_override=recipients)
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv=None) -> int:
     setup_logger()
     try:
         from dotenv import load_dotenv
@@ -691,10 +625,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         return outcome.code
 
-    return run_pipeline(
-        cfg, dry_run=args.dry_run, force=args.force,
-        github_only=args.github_only, recipients_override=args.to,
-    )
+    return run_pipeline(cfg, dry_run=args.dry_run, force=args.force,
+                        github_only=args.github_only, recipients_override=args.to)
 
 
 if __name__ == "__main__":

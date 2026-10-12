@@ -27,15 +27,9 @@ def send(
     password: str | None = None,
     from_addr: str | None = None,
     sender_name: str | None = None,
+    subject: str | None = None,                # ⭐ 新增：自定义主题
     max_retries: int = 2,
 ) -> bool:
-    """发送 HTML 格式日报邮件。
-
-    契约核心参数为 (report, recipients)；SMTP 细节可通过关键字传入，
-    缺省时回退环境变量：SMTP_HOST / SMTP_PORT / SMTP_USERNAME / SMTP_PASSWORD / SMTP_FROM。
-
-    sender_name 用于在邮件客户端显示"刘雨可 <2327929235@qq.com>"这种友好格式。
-    """
     if not recipients:
         logger.error("邮件收件人为空")
         return False
@@ -53,15 +47,15 @@ def send(
         logger.error("SMTP 配置不完整（host/username/password/from）")
         return False
 
-    subject = f"{report.team_name} 日报 — {report.date.isoformat()}"
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
+    # 默认主题；有 subject 参数就用传入的
+    if not subject:
+        subject = f"{report.team_name} 日报 — {report.date.isoformat()}"
 
-    # 显示名优先 sender_name（如"刘雨可"），没有就只显示地址
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = Header(subject, "utf-8")
+
     if sender_name:
-        msg["From"] = formataddr(
-            (str(Header(sender_name, "utf-8")), from_addr)
-        )
+        msg["From"] = formataddr((str(Header(sender_name, "utf-8")), from_addr))
     else:
         msg["From"] = from_addr
     msg["To"] = ", ".join(recipients)
@@ -80,7 +74,7 @@ def send(
                 use_ssl=use_ssl,
                 username=username,
                 password=password,
-                envelope_from=from_addr,   # 纯邮箱地址，用于 SMTP 信封
+                envelope_from=from_addr,
             )
             return True
         except Exception as exc:  # noqa: BLE001
