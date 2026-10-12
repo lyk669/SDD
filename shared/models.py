@@ -13,7 +13,7 @@ T = TypeVar("T")
 class FileChange:
     """单个文件的改动明细。"""
     filename: str
-    status: str = "modified"     # added / modified / removed / renamed
+    status: str = "modified"
     additions: int = 0
     deletions: int = 0
 
@@ -45,6 +45,17 @@ class EventRecord:
 
 
 @dataclass
+class MessageRecord:
+    """飞书群消息。"""
+    sender_id: str
+    sender_name: str
+    chat_id: str
+    text: str
+    msg_type: str
+    timestamp: datetime
+
+
+@dataclass
 class TaskRecord:
     assignee: str
     title: str
@@ -64,6 +75,7 @@ class CollectResult(Generic[T]):
     success: bool
     records: list[T] = field(default_factory=list)
     error_message: str | None = None
+    meta: dict = field(default_factory=dict)     # ← 新增：附加统计信息
 
 
 @dataclass

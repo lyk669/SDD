@@ -1,12 +1,4 @@
-"""智能日报生成器 — 主编排入口。
-
-用法:
-  python main.py                    # 完整流程：采集 → 生成 → 推送
-  python main.py --auto             # 一键自动：读 GitHub → 生成 → 发到配置的收件人
-  python main.py --check            # 健康检查
-  python main.py --dry-run          # 采集+生成，不推送
-  python main.py --github-only      # 只采集 GitHub 并发送日报，跳过飞书任务
-"""
+"""智能日报生成器 — 主编排入口。"""
 
 from __future__ import annotations
 
@@ -17,15 +9,24 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 
+from collector import feishu_message as feishu_message_collector
 from collector import github as github_collector
 from collector import github_events as github_events_collector
 from collector import lark_task as lark_task_collector
 from generator.formatter import generate
+from generator.summarizer import summarize
 from notifier import email as email_notifier
 from shared.config import AppConfig, load_config
 from shared.errors import ConfigError
 from shared.logger import get_logger, setup_logger
-from shared.models import CollectResult, CommitRecord, EventRecord, MemberReport, TaskRecord
+from shared.models import (
+    CollectResult,
+    CommitRecord,
+    EventRecord,
+    MemberReport,
+    MessageRecord,
+    TaskRecord,
+)
 from shared.storage import ReportStorage
 
 logger = get_logger("daily_report.main")
@@ -34,6 +35,10 @@ FALLBACK_RECIPIENTS: list[str] = ["2327929235@qq.com"]
 
 EMAIL_MAX_RETRIES = 2
 EMAIL_RETRY_INTERVAL = 5
+
+_OPEN_ID_NAME_MAP: dict[str, str] = {
+    # "ou_b4ebc00c714fdb8106be03417170341d": "刘雨可",
+}
 
 
 def _local_tz():
@@ -55,20 +60,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="不推送，仅采集生成")
     parser.add_argument("--force", action="store_true", help="忽略非工作日限制")
     parser.add_argument(
-        "--github-only",
-        action="store_true",
-        help="只采集 GitHub 并发送日报，跳过飞书任务",
+        "--github-only", action="store_true",
+        help="只采集 GitHub，跳过飞书任务和消息",
     )
     parser.add_argument(
-        "--auto",
-        action="store_true",
-        help="一键自动：只读 GitHub、忽略工作日限制，生成并发送到配置的收件人",
+        "--auto", action="store_true",
+        help="一键自动：采集 GitHub + 飞书任务 + 飞书消息，生成并发送",
     )
     parser.add_argument(
-        "--to",
-        action="append",
-        default=None,
-        help="临时指定收件人邮箱，可重复，如 --to a@x.com --to b@y.com",
+        "--to", action="append", default=None,
+        help="临时指定收件人邮箱，可重复",
     )
     return parser.parse_args(argv)
 
@@ -96,6 +97,22 @@ def is_workday(cfg: AppConfig, day: date | None = None) -> bool:
     return True
 
 
+def _build_open_id_name_map(cfg: AppConfig) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for oid, name in _OPEN_ID_NAME_MAP.items():
+        if oid and name:
+            mapping[oid.strip().lower()] = name.strip()
+    for m in cfg.members:
+        name = m.name
+        if getattr(m, "lark_open_id", None):
+            oid = m.lark_open_id.strip().lower()
+            mapping.setdefault(oid, name)
+        if getattr(m, "lark_user_id", None):
+            uid = m.lark_user_id.strip().lower()
+            mapping.setdefault(uid, name)
+    return mapping
+
+
 def aggregate_members(
     cfg: AppConfig,
     commits: CollectResult[CommitRecord],
@@ -105,9 +122,17 @@ def aggregate_members(
     for c in commits.records:
         github_by_user.setdefault(c.author.lower(), []).append(c)
 
+    open_id_name_map = _build_open_id_name_map(cfg)
+
     tasks_by_user: dict[str, list[TaskRecord]] = {}
     for t in tasks.records:
-        tasks_by_user.setdefault(t.assignee.lower(), []).append(t)
+        raw_assignee = (t.assignee or "").strip()
+        key = raw_assignee.lower()
+        mapped_name = open_id_name_map.get(key)
+        if mapped_name:
+            t.assignee = mapped_name
+            key = mapped_name.lower()
+        tasks_by_user.setdefault(key, []).append(t)
 
     def _collect_for(keys: set[str], bucket: dict) -> list:
         seen: set[int] = set()
@@ -124,6 +149,13 @@ def aggregate_members(
     members: list[MemberReport] = []
     for m in cfg.members:
         keys = m.identity_keys()
+        if getattr(m, "lark_open_id", None):
+            keys.add(m.lark_open_id.strip().lower())
+        if getattr(m, "lark_user_id", None):
+            keys.add(m.lark_user_id.strip().lower())
+        for oid, name in open_id_name_map.items():
+            if name == m.name:
+                keys.add(oid)
         members.append(
             MemberReport(
                 name=m.name,
@@ -152,15 +184,29 @@ def aggregate_members(
                 tasks_failed=not tasks.success,
             )
         )
+
+    assigned_tasks: set[int] = {id(t) for m in members for t in m.tasks}
+    leftover_tasks: dict[str, list[TaskRecord]] = {}
+    for rec in tasks.records:
+        if id(rec) in assigned_tasks:
+            continue
+        leftover_tasks.setdefault(rec.assignee or "unknown", []).append(rec)
+    for assignee, recs in leftover_tasks.items():
+        members.append(
+            MemberReport(
+                name=f"未映射 · {assignee}",
+                github_username="",
+                commits=[],
+                tasks=recs,
+                commits_failed=not commits.success,
+                tasks_failed=not tasks.success,
+            )
+        )
     return members
 
 
 def run_collect(
-    cfg: AppConfig,
-    since: datetime,
-    until: datetime,
-    *,
-    github_only: bool = False,
+    cfg: AppConfig, since: datetime, until: datetime, *, github_only: bool = False
 ) -> tuple[CollectResult[CommitRecord], CollectResult[TaskRecord]]:
     github_token = None
     try:
@@ -170,15 +216,9 @@ def run_collect(
 
     branch = cfg.github.get("branch") or "main"
     commits = github_collector.collect(
-        cfg.github["repos"],
-        since,
-        until,
-        branch=branch,
-        token=github_token,
+        cfg.github["repos"], since, until, branch=branch, token=github_token,
     )
-    logger.info(
-        f"GitHub 采集完成: success={commits.success}, count={len(commits.records)}, branch={branch}",
-    )
+    logger.info(f"GitHub 采集完成: success={commits.success}, count={len(commits.records)}, branch={branch}")
 
     if github_only:
         logger.info("github-only 模式，跳过飞书任务采集")
@@ -193,13 +233,13 @@ def run_collect(
 
     if app_id and app_secret:
         tasklist_id = cfg.lark.get("tasklist_id") or cfg.lark.get("project_id") or ""
-        tasks = lark_task_collector.collect(
-            tasklist_id,
-            since,
-            until,
-            app_id=app_id,
-            app_secret=app_secret,
-        )
+        if not tasklist_id:
+            logger.info("未配置 lark.tasklist_id，跳过飞书任务采集")
+            tasks = CollectResult(success=True, records=[], error_message="")
+        else:
+            tasks = lark_task_collector.collect(
+                tasklist_id, since, until, app_id=app_id, app_secret=app_secret,
+            )
     else:
         tasks = CollectResult(success=False, records=[], error_message="缺少飞书凭证")
 
@@ -208,11 +248,8 @@ def run_collect(
 
 
 def run_collect_events(
-    cfg: AppConfig,
-    since: datetime,
-    until: datetime,
+    cfg: AppConfig, since: datetime, until: datetime
 ) -> CollectResult[EventRecord]:
-    """采集成员 GitHub 公开活动。失败不影响主流程。"""
     usernames = [m.github for m in cfg.members if m.github]
     if not usernames:
         return CollectResult(success=True, records=[])
@@ -221,9 +258,7 @@ def run_collect_events(
     except ConfigError:
         token = None
     try:
-        result = github_events_collector.collect(
-            usernames, since, until, token=token,
-        )
+        result = github_events_collector.collect(usernames, since, until, token=token)
         logger.info(f"GitHub 活动采集完成: success={result.success}, count={len(result.records)}")
         return result
     except Exception as exc:  # noqa: BLE001
@@ -231,13 +266,35 @@ def run_collect_events(
         return CollectResult(success=False, records=[], error_message=str(exc))
 
 
+def run_collect_feishu_messages(
+    cfg: AppConfig, since: datetime, until: datetime
+) -> CollectResult[MessageRecord]:
+    chat_id = cfg.lark.get("target_chat_id") or ""
+    if not chat_id:
+        logger.info("未配置 lark.target_chat_id，跳过飞书消息采集")
+        return CollectResult(success=True, records=[])
+    try:
+        app_id, app_secret = cfg.lark_credentials()
+    except ConfigError:
+        return CollectResult(success=False, records=[], error_message="缺少飞书凭证")
+    if not app_id or not app_secret:
+        return CollectResult(success=False, records=[], error_message="缺少飞书凭证")
+    try:
+        result = feishu_message_collector.collect(
+            chat_id, since, until, app_id=app_id, app_secret=app_secret,
+        )
+        logger.info(f"飞书消息采集完成: success={result.success}, count={len(result.records)}")
+        return result
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"飞书消息采集跳过: {exc}")
+        return CollectResult(success=False, records=[], error_message=str(exc))
+
+
 def run_check(cfg: AppConfig) -> int:
     import httpx
-
     from collector.lark_task import LarkTokenProvider
 
     ok = True
-
     for label, fn in (
         ("GITHUB_TOKEN", cfg.github_token),
         ("LARK credentials", cfg.lark_credentials),
@@ -262,6 +319,16 @@ def run_check(cfg: AppConfig) -> int:
     logger.info(f"[check] recipients (收件人): {_resolve_recipients(cfg)}")
     logger.info(f"[check] sender_name (显示名): {cfg.email.get('sender_name') or '(未配置)'}")
 
+    target_chat = cfg.lark.get("target_chat_id") or ""
+    logger.info(f"[check] 飞书消息采集群: {target_chat or '(未配置)'}")
+
+    m = _build_open_id_name_map(cfg)
+    logger.info(f"[check] open_id 映射条数: {len(m)}")
+
+    import os
+    ds_key = os.environ.get("DEEPSEEK_API_KEY", "")
+    logger.info(f"[check] DeepSeek API Key: {'已配置' if ds_key else '(未配置，跳过今日总结)'}")
+
     try:
         token = cfg.github_token()
         branch = cfg.github.get("branch") or "main"
@@ -275,8 +342,7 @@ def run_check(cfg: AppConfig) -> int:
         ) as client:
             resp = client.get("/user")
             resp.raise_for_status()
-            login = resp.json().get("login", "?")
-            logger.info(f"[check] GitHub API OK (user={login})")
+            logger.info(f"[check] GitHub API OK (user={resp.json().get('login','?')})")
             for repo in cfg.github.get("repos") or []:
                 r = client.get(f"/repos/{repo}")
                 if r.status_code == 200:
@@ -297,7 +363,7 @@ def run_check(cfg: AppConfig) -> int:
                 token = LarkTokenProvider(app_id, app_secret, client=client).get_token()
                 logger.info(f"[check] Lark token OK (len={len(token)})")
         else:
-            logger.info("[check] Lark credentials 未配置，跳过（仅 GitHub 模式无需）")
+            logger.info("[check] Lark credentials 未配置，跳过")
     except ConfigError:
         pass
     except Exception as exc:  # noqa: BLE001
@@ -305,7 +371,6 @@ def run_check(cfg: AppConfig) -> int:
 
     try:
         import smtplib
-
         user, password = cfg.smtp_credentials()
         host = cfg.email["smtp_host"]
         port = int(cfg.email.get("smtp_port") or 465)
@@ -336,6 +401,8 @@ class PipelineOutcome:
     github: dict[str, Any] = field(default_factory=dict)
     lark: dict[str, Any] = field(default_factory=dict)
     events: dict[str, Any] = field(default_factory=dict)
+    feishu_msgs: dict[str, Any] = field(default_factory=dict)
+    summary: str = ""
     sender: str = ""
     recipients: list[str] = field(default_factory=list)
     email_sent: bool = False
@@ -353,56 +420,45 @@ def _iso(value: datetime | None) -> str:
 def _commit_payload(c: CommitRecord) -> dict[str, Any]:
     file_details = []
     for fd in (getattr(c, "file_details", None) or []):
-        file_details.append(
-            {
-                "filename": getattr(fd, "filename", ""),
-                "status": getattr(fd, "status", "modified"),
-                "additions": int(getattr(fd, "additions", 0) or 0),
-                "deletions": int(getattr(fd, "deletions", 0) or 0),
-            }
-        )
+        file_details.append({
+            "filename": getattr(fd, "filename", ""),
+            "status": getattr(fd, "status", "modified"),
+            "additions": int(getattr(fd, "additions", 0) or 0),
+            "deletions": int(getattr(fd, "deletions", 0) or 0),
+        })
     return {
-        "author": c.author,
-        "message": c.message,
-        "timestamp": _iso(c.timestamp),
-        "repo": c.repo,
-        "additions": c.additions,
-        "deletions": c.deletions,
-        "files_changed": c.files_changed,
-        "sha": c.sha,
-        "files": list(c.files or []),
-        "file_details": file_details,
-        "url": c.url,
+        "author": c.author, "message": c.message, "timestamp": _iso(c.timestamp),
+        "repo": c.repo, "additions": c.additions, "deletions": c.deletions,
+        "files_changed": c.files_changed, "sha": c.sha,
+        "files": list(c.files or []), "file_details": file_details, "url": c.url,
     }
 
 
 def _event_payload(e: EventRecord) -> dict[str, Any]:
     return {
-        "actor": e.actor,
-        "event_type": e.event_type,
-        "repo": e.repo,
-        "summary": e.summary,
-        "timestamp": _iso(e.timestamp),
-        "url": e.url,
+        "actor": e.actor, "event_type": e.event_type, "repo": e.repo,
+        "summary": e.summary, "timestamp": _iso(e.timestamp), "url": e.url,
+    }
+
+
+def _message_payload(m: MessageRecord) -> dict[str, Any]:
+    return {
+        "sender_id": m.sender_id, "sender_name": m.sender_name,
+        "chat_id": m.chat_id, "text": m.text,
+        "msg_type": m.msg_type, "timestamp": _iso(m.timestamp),
     }
 
 
 def _task_payload(t: TaskRecord) -> dict[str, Any]:
     return {
-        "assignee": t.assignee,
-        "title": t.title,
-        "status_from": t.status_from,
-        "status_to": t.status_to,
+        "assignee": t.assignee, "title": t.title,
+        "status_from": t.status_from, "status_to": t.status_to,
         "updated_at": _iso(t.updated_at),
     }
 
 
 def _resolve_sender(cfg: AppConfig) -> str:
-    sender = (
-        cfg.email.get("from_addr")
-        or cfg.email.get("sender")
-        or ""
-    )
+    sender = cfg.email.get("from_addr") or cfg.email.get("sender") or ""
     if sender:
         return sender.strip()
     try:
@@ -412,10 +468,7 @@ def _resolve_sender(cfg: AppConfig) -> str:
         return ""
 
 
-def _resolve_recipients(
-    cfg: AppConfig,
-    override: list[str] | None = None,
-) -> list[str]:
+def _resolve_recipients(cfg: AppConfig, override: list[str] | None = None) -> list[str]:
     candidates: list[str] = []
     if override:
         candidates.extend(override)
@@ -423,7 +476,6 @@ def _resolve_recipients(
         candidates.extend(list(cfg.email.get("recipients") or []))
         if not candidates:
             candidates.extend(FALLBACK_RECIPIENTS)
-
     recipients: list[str] = []
     for addr in candidates:
         addr = (addr or "").strip()
@@ -433,12 +485,8 @@ def _resolve_recipients(
 
 
 def _send_email_with_retry(
-    report,
-    recipients: list[str],
-    cfg: AppConfig,
-    *,
-    max_retries: int = EMAIL_MAX_RETRIES,
-    interval: int = EMAIL_RETRY_INTERVAL,
+    report, recipients, cfg,
+    *, max_retries=EMAIL_MAX_RETRIES, interval=EMAIL_RETRY_INTERVAL,
 ) -> bool:
     user, password = cfg.smtp_credentials()
     from_addr = _resolve_sender(cfg) or user
@@ -448,15 +496,12 @@ def _send_email_with_retry(
     for attempt in range(1, max_retries + 1):
         try:
             ok = email_notifier.send(
-                report,
-                recipients,
+                report, recipients,
                 smtp_host=cfg.email["smtp_host"],
                 smtp_port=int(cfg.email.get("smtp_port") or 465),
                 use_ssl=bool(cfg.email.get("use_ssl", True)),
-                username=user,
-                password=password,
-                from_addr=from_addr,
-                sender_name=sender_name,
+                username=user, password=password,
+                from_addr=from_addr, sender_name=sender_name,
             )
             if ok:
                 if attempt > 1:
@@ -492,67 +537,73 @@ def execute_pipeline(
     since, until = collection_window(started, lookback_days=lookback_days)
     commits, tasks = run_collect(cfg, since, until, github_only=github_only)
     github_info = {
-        "success": commits.success,
-        "count": len(commits.records),
+        "success": commits.success, "count": len(commits.records),
         "error": commits.error_message or "",
-        "since": _iso(since),
-        "until": _iso(until),
+        "since": _iso(since), "until": _iso(until),
     }
     lark_info = {
-        "success": tasks.success,
-        "count": len(tasks.records),
+        "success": tasks.success, "count": len(tasks.records),
         "error": tasks.error_message or "",
     }
 
     if not (commits.success or tasks.success):
         logger.error("所有数据源不可用，不生成空日报")
         return PipelineOutcome(
-            code=1,
-            message="所有数据源不可用，未生成日报",
-            github=github_info,
-            lark=lark_info,
+            code=1, message="所有数据源不可用，未生成日报",
+            github=github_info, lark=lark_info,
         )
 
     events_result = run_collect_events(cfg, since, until)
     events_records = events_result.records
     events_info = {
-        "success": events_result.success,
-        "count": len(events_records),
+        "success": events_result.success, "count": len(events_records),
         "error": events_result.error_message or "",
     }
 
+    feishu_msgs_result = run_collect_feishu_messages(cfg, since, until)
+    feishu_msgs = feishu_msgs_result.records
+    feishu_msgs_info = {
+        "success": feishu_msgs_result.success,
+        "count": len(feishu_msgs),
+        "error": feishu_msgs_result.error_message or "",
+        "meta": feishu_msgs_result.meta,                    # ← 新增
+    }
+
     members = aggregate_members(cfg, commits, tasks)
+
+    summary = summarize(members, feishu_msgs, until.date()) or ""
+
     report = generate(
-        members,
-        until.date(),
-        cfg.team_name,
+        members, until.date(), cfg.team_name,
         events=events_records,
+        feishu_messages=feishu_msgs,
+        feishu_stats=feishu_msgs_result.meta,               # ← 新增
+        summary=summary,
         generated_at=started,
     )
     payload = {
-        "sources": {"github": github_info, "lark": lark_info, "events": events_info},
+        "sources": {
+            "github": github_info, "lark": lark_info,
+            "events": events_info, "feishu_messages": feishu_msgs_info,
+        },
+        "summary": summary,
         "members": [
             {
-                "name": m.name,
-                "github_username": m.github_username,
-                "commits_failed": m.commits_failed,
-                "tasks_failed": m.tasks_failed,
+                "name": m.name, "github_username": m.github_username,
+                "commits_failed": m.commits_failed, "tasks_failed": m.tasks_failed,
                 "commits": [_commit_payload(c) for c in m.commits],
                 "tasks": [_task_payload(t) for t in m.tasks],
             }
             for m in members
         ],
         "events": [_event_payload(e) for e in events_records],
+        "feishu_messages": [_message_payload(m) for m in feishu_msgs],
     }
 
     storage = ReportStorage(cfg.storage["db_path"])
     report_id = storage.save(
-        report.date,
-        report.team_name,
-        report.markdown,
-        report.html,
-        report.generated_at,
-        payload=payload,
+        report.date, report.team_name, report.markdown, report.html,
+        report.generated_at, payload=payload,
     )
     logger.info(f"日报已写入 SQLite id={report_id}")
 
@@ -565,14 +616,11 @@ def execute_pipeline(
         logger.info(f"收件人: {recipients}")
         logger.info(f"日报任务结束: {(datetime.now(LOCAL_TZ) - started)}")
         return PipelineOutcome(
-            code=0,
-            report_id=report_id,
+            code=0, report_id=report_id,
             message="日报已生成（dry-run，未发信）",
-            github=github_info,
-            lark=lark_info,
-            events=events_info,
-            sender=sender,
-            recipients=recipients,
+            github=github_info, lark=lark_info, events=events_info,
+            feishu_msgs=feishu_msgs_info, summary=summary,
+            sender=sender, recipients=recipients,
         )
 
     email_ok = False
@@ -586,57 +634,35 @@ def execute_pipeline(
     logger.info(f"推送结果: email={email_ok}")
     logger.info(f"日报任务结束: {(datetime.now(LOCAL_TZ) - started)}")
     return PipelineOutcome(
-        code=0 if email_ok else 1,
-        report_id=report_id,
+        code=0 if email_ok else 1, report_id=report_id,
         message="日报已生成" + ("并已发信" if email_ok else "，邮件未发送"),
-        github=github_info,
-        lark=lark_info,
-        events=events_info,
-        sender=sender,
-        recipients=recipients,
-        email_sent=email_ok,
+        github=github_info, lark=lark_info, events=events_info,
+        feishu_msgs=feishu_msgs_info, summary=summary,
+        sender=sender, recipients=recipients, email_sent=email_ok,
     )
 
 
 def run_pipeline(
-    cfg: AppConfig,
-    *,
-    dry_run: bool = False,
-    force: bool = False,
-    lookback_days: int = 1,
-    github_only: bool = False,
-    recipients_override: list[str] | None = None,
+    cfg, *, dry_run=False, force=False, lookback_days=1,
+    github_only=False, recipients_override=None,
 ) -> int:
     return execute_pipeline(
-        cfg,
-        dry_run=dry_run,
-        force=force,
-        lookback_days=lookback_days,
-        github_only=github_only,
-        recipients_override=recipients_override,
+        cfg, dry_run=dry_run, force=force, lookback_days=lookback_days,
+        github_only=github_only, recipients_override=recipients_override,
     ).code
 
 
-def run_auto(
-    config_path: str = "config.yaml",
-    recipients: list[str] | None = None,
-) -> PipelineOutcome:
+def run_auto(config_path: str = "config.yaml", recipients: list[str] | None = None) -> PipelineOutcome:
     setup_logger()
     try:
         from dotenv import load_dotenv
-
         load_dotenv()
     except ImportError:
         pass
-
     cfg = load_config(config_path)
     return execute_pipeline(
-        cfg,
-        dry_run=False,
-        force=True,
-        github_only=True,
-        lookback_days=1,
-        recipients_override=recipients,
+        cfg, dry_run=False, force=True, github_only=False,
+        lookback_days=1, recipients_override=recipients,
     )
 
 
@@ -644,7 +670,6 @@ def main(argv: list[str] | None = None) -> int:
     setup_logger()
     try:
         from dotenv import load_dotenv
-
         load_dotenv()
     except ImportError:
         pass
@@ -661,21 +686,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.auto:
         outcome = execute_pipeline(
-            cfg,
-            dry_run=args.dry_run,     # ← 尊重 --dry-run
-            force=True,
-            github_only=True,
-            lookback_days=1,
-            recipients_override=args.to,
+            cfg, dry_run=args.dry_run, force=True, github_only=False,
+            lookback_days=1, recipients_override=args.to,
         )
         return outcome.code
 
     return run_pipeline(
-        cfg,
-        dry_run=args.dry_run,
-        force=args.force,
-        github_only=args.github_only,
-        recipients_override=args.to,
+        cfg, dry_run=args.dry_run, force=args.force,
+        github_only=args.github_only, recipients_override=args.to,
     )
 
 
