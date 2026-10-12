@@ -159,13 +159,14 @@ def collect(
                 if msg_type != "text":
                     continue
 
-                # ⭐ 跳过已撤回的消息
+                # ⭐ 所有 text 类型都算"收到"
+                received_count += 1
+
+                # 跳过已撤回的消息
                 if item.get("deleted"):
                     skipped_count += 1
                     logger.debug(f"跳过已撤回消息: {item.get('message_id')}")
                     continue
-
-                received_count += 1
 
                 sender_info = item.get("sender") or {}
                 sender_type = (sender_info.get("sender_type") or "").lower()

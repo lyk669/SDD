@@ -15,10 +15,11 @@ from collector import github_events as github_events_collector
 from collector import lark_task as lark_task_collector
 from generator.formatter import generate
 from generator.summarizer import (
-    extract_action_items,        # ⭐ 新增
+    compare_with_yesterday,
+    extract_action_items,
     extract_highlights,
     summarize,
-    summarize_commits,           # ⭐ 新增
+    summarize_commits,
 )
 from notifier import email as email_notifier
 from notifier import feishu as feishu_notifier
@@ -26,7 +27,12 @@ from shared.config import AppConfig, load_config
 from shared.errors import ConfigError
 from shared.logger import get_logger, setup_logger
 from shared.models import (
-    CollectResult, CommitRecord, EventRecord, MemberReport, MessageRecord, TaskRecord,
+    CollectResult,
+    CommitRecord,
+    EventRecord,
+    MemberReport,
+    MessageRecord,
+    TaskRecord,
 )
 from shared.storage import ReportStorage
 
@@ -44,6 +50,7 @@ _OPEN_ID_NAME_MAP: dict[str, str] = {}
 def _local_tz():
     try:
         from zoneinfo import ZoneInfo
+
         return ZoneInfo("Asia/Shanghai")
     except Exception:  # noqa: BLE001
         return timezone(timedelta(hours=8), name="Asia/Shanghai")
@@ -259,7 +266,8 @@ def run_collect_feishu_messages(cfg, since, until):
 
 
 def run_check(cfg) -> int:
-    import httpx, os
+    import httpx
+    import os
     from collector.lark_task import LarkTokenProvider
 
     ok = True
@@ -327,8 +335,9 @@ class PipelineOutcome:
     feishu_msgs: dict[str, Any] = field(default_factory=dict)
     summary: str = ""
     highlights: list[str] = field(default_factory=list)
-    action_items: list[dict] = field(default_factory=list)      # ⭐ 新增
-    commit_summaries: dict[str, str] = field(default_factory=dict)  # ⭐ 新增
+    action_items: list[dict] = field(default_factory=list)
+    commit_summaries: dict[str, str] = field(default_factory=dict)
+    comparison: dict = field(default_factory=dict)
     sender: str = ""
     recipients: list[str] = field(default_factory=list)
     email_sent: bool = False
@@ -429,10 +438,13 @@ def _send_email_with_retry(report, recipients, cfg, subject,
                 subject=subject,
             )
             if ok:
+                if attempt > 1:
+                    logger.info(f"邮件第 {attempt} 次尝试发送成功")
                 return True
+            logger.warning(f"邮件发送返回失败（第 {attempt}/{max_retries} 次）")
         except Exception as exc:  # noqa: BLE001
             last_err = exc
-            logger.warning(f"邮件发送异常: {exc}")
+            logger.warning(f"邮件发送异常（第 {attempt}/{max_retries} 次）: {exc}")
         if attempt < max_retries:
             _time.sleep(interval)
     if last_err:
@@ -448,6 +460,7 @@ def _send_feishu_with_report(cfg, report, members, highlights, summary, subject)
     try:
         app_id, app_secret = cfg.lark_credentials()
     except ConfigError:
+        logger.warning("缺少飞书凭证，跳过飞书推送")
         return False
     if not app_id or not app_secret:
         return False
@@ -483,7 +496,8 @@ def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
 
     if not (commits.success or tasks.success):
         logger.error("所有数据源不可用，不生成空日报")
-        return PipelineOutcome(code=1, message="所有数据源不可用", github=github_info, lark=lark_info)
+        return PipelineOutcome(code=1, message="所有数据源不可用",
+                               github=github_info, lark=lark_info)
 
     events_result = run_collect_events(cfg, since, until)
     events_records = events_result.records
@@ -499,14 +513,30 @@ def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
 
     members = aggregate_members(cfg, commits, tasks)
 
+    # 读昨天数据
     storage = ReportStorage(cfg.storage["db_path"])
     yesterday_stats = storage.get_yesterday_stats(until.date())
+    if yesterday_stats:
+        logger.info(f"读到昨日统计: {yesterday_stats}")
+    else:
+        logger.info("无昨日统计数据，跳过数字对比")
 
-    # LLM：总结、亮点、群讨论要点、commit 摘要
+    yesterday_payload = storage.get_payload_by_date(until.date() - timedelta(days=1))
+    if yesterday_payload:
+        logger.info("读到昨日完整日报，可做变化分析")
+    else:
+        logger.info("无昨日完整日报")
+
+    # LLM 分析
     summary = summarize(members, feishu_msgs, until.date()) or ""
     highlights = extract_highlights(members, feishu_msgs, until.date(), top_n=3)
-    action_items = extract_action_items(members, feishu_msgs, until.date(), max_items=5)  # ⭐
-    commit_summaries = summarize_commits(members, until.date(), max_commits=20)           # ⭐
+    action_items = extract_action_items(members, feishu_msgs, until.date(), max_items=5)
+    commit_summaries = summarize_commits(members, until.date(), max_commits=20)
+
+    # 昨日对比分析
+    comparison = compare_with_yesterday(
+        members, summary, highlights, yesterday_payload, until.date(),
+    ) or {}
 
     report = generate(
         members, until.date(), cfg.team_name,
@@ -515,8 +545,9 @@ def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
         feishu_stats=feishu_msgs_result.meta,
         yesterday_stats=yesterday_stats,
         highlights=highlights,
-        action_items=action_items,                # ⭐
-        commit_summaries=commit_summaries,        # ⭐
+        action_items=action_items,
+        commit_summaries=commit_summaries,
+        comparison=comparison,
         summary=summary,
         generated_at=started,
     )
@@ -527,6 +558,7 @@ def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
         "highlights": highlights,
         "action_items": action_items,
         "commit_summaries": commit_summaries,
+        "comparison": comparison,
         "members": [
             {"name": m.name, "github_username": m.github_username,
              "commits_failed": m.commits_failed, "tasks_failed": m.tasks_failed,
@@ -552,6 +584,7 @@ def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
         logger.info(f"发件人: {sender}")
         logger.info(f"收件人: {recipients}")
         logger.info(f"飞书推送群: {cfg.lark.get('notify_chat_id') or '(未配置)'}")
+        logger.info(f"日报任务结束: {(datetime.now(LOCAL_TZ) - started)}")
         return PipelineOutcome(
             code=0, report_id=report_id,
             message="日报已生成（dry-run）",
@@ -559,22 +592,37 @@ def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
             feishu_msgs=feishu_msgs_info, summary=summary,
             highlights=highlights, action_items=action_items,
             commit_summaries=commit_summaries,
+            comparison=comparison,
             sender=sender, recipients=recipients,
         )
 
-    email_ok = _send_email_with_retry(report, recipients, cfg, subject)
-    feishu_ok = _send_feishu_with_report(cfg, report, members, highlights, summary, subject)
+    # 推邮件
+    email_ok = False
+    try:
+        logger.info(f"准备发送日报邮件 | 主题: {subject} | 收件人: {recipients}")
+        email_ok = _send_email_with_retry(report, recipients, cfg, subject)
+        logger.info(f"邮件发送{'成功' if email_ok else '失败'}")
+    except ConfigError as exc:
+        logger.error(f"邮件推送跳过: {exc}")
+
+    # 推飞书
+    feishu_ok = _send_feishu_with_report(
+        cfg, report, members, highlights, summary, subject,
+    )
 
     logger.info(f"推送结果: email={email_ok} feishu={feishu_ok}")
     logger.info(f"日报任务结束: {(datetime.now(LOCAL_TZ) - started)}")
     return PipelineOutcome(
         code=0 if (email_ok or feishu_ok) else 1,
         report_id=report_id,
-        message="日报已生成",
+        message="日报已生成"
+                + ("，邮件已发" if email_ok else "，邮件未发")
+                + ("，飞书已推送" if feishu_ok else "，飞书未推送"),
         github=github_info, lark=lark_info, events=events_info,
         feishu_msgs=feishu_msgs_info, summary=summary,
         highlights=highlights, action_items=action_items,
         commit_summaries=commit_summaries,
+        comparison=comparison,
         sender=sender, recipients=recipients,
         email_sent=email_ok, feishu_sent=feishu_ok,
     )

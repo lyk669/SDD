@@ -1,6 +1,6 @@
 """日报生成器 — 输出 Markdown + HTML。
 
-结构：概览 → 消息过滤 → 今日亮点 → 今日总结 → 群讨论要点
+结构：概览 → 消息过滤 → 今日亮点 → 今日总结 → 相比昨天 → 群讨论要点
       → 新增/删除文件 → commit 明细（含 diff 摘要）→ 群消息 → 底部
 """
 
@@ -67,6 +67,11 @@ _ACTION_LABEL = {
     "issue": ("⚠️", "问题"),
 }
 
+_TREND_ICON = {
+    "功能推进": "📈", "修复完善": "🔧", "重构优化": "♻️",
+    "文档维护": "📝", "常规迭代": "🔁",
+}
+
 
 def _commit_type_tag(message: str) -> str:
     if not message:
@@ -109,19 +114,19 @@ def _time_slot(dt: datetime) -> str:
     return "evening"
 
 
-def _fmt_time(dt: datetime | None) -> str:
+def _fmt_time(dt) -> str:
     if dt is None:
         return "--:--"
     return _to_local(dt).strftime("%H:%M")
 
 
-def _fmt_datetime(dt: datetime | None) -> str:
+def _fmt_datetime(dt) -> str:
     if dt is None:
         return "---- --:--"
     return _to_local(dt).strftime("%Y-%m-%d %H:%M")
 
 
-def _short_sha(sha: str | None) -> str:
+def _short_sha(sha) -> str:
     return (sha or "-------")[:7]
 
 
@@ -177,11 +182,14 @@ def _shorten(s: str, max_w: int = 30) -> str:
     return "".join(out)
 
 
-def _wrap_text(text: str, indent: str, width: int = 76) -> list[str]:
-    """按显示宽度折行，返回带缩进的行列表。"""
+def _wrap_text(text: str, indent: str, width: int = 76,
+               cont_indent: str | None = None) -> list[str]:
+    """按显示宽度折行。第一行用 indent，续行用 cont_indent（缺省=indent）。"""
     text = (text or "").strip()
     if not text:
         return []
+    if cont_indent is None:
+        cont_indent = indent
     lines = []
     cur = indent
     cur_w = _disp_width(indent)
@@ -189,8 +197,8 @@ def _wrap_text(text: str, indent: str, width: int = 76) -> list[str]:
         cw = 2 if ord(ch) > 0x2E80 else 1
         if cur_w + cw > width:
             lines.append(cur)
-            cur = indent
-            cur_w = _disp_width(indent)
+            cur = cont_indent
+            cur_w = _disp_width(cont_indent)
         cur += ch
         cur_w += cw
     if cur.strip():
@@ -237,7 +245,7 @@ def _sort_messages(messages: list) -> list:
     )
 
 
-def _delta_str(cur: int, prev: int | None) -> str:
+def _delta_str(cur: int, prev) -> str:
     if prev is None:
         return ""
     diff = cur - prev
@@ -263,6 +271,7 @@ def _render_markdown(
     highlights: list[str] | None = None,
     action_items: list[dict] | None = None,
     commit_summaries: dict[str, str] | None = None,
+    comparison: dict | None = None,
 ) -> str:
     events = events or []
     feishu_messages = feishu_messages or []
@@ -312,7 +321,6 @@ def _render_markdown(
     lines.append("")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
-    # 概览
     lines.append("📊 今日概览")
     lines.append(f"  提交次数    {total_commits} 次{_delta_str(total_commits, y_commits)}")
     lines.append(
@@ -355,7 +363,34 @@ def _render_markdown(
                     lines.append(wl)
         lines.append("")
 
-    # 群讨论要点
+    # 相比昨天
+    if comparison:
+        y = comparison.get("yesterday", {}) or {}
+        t = comparison.get("today", {}) or {}
+        yc = int(y.get("commits", 0) or 0)
+        ya = int(y.get("additions", 0) or 0)
+        yd = int(y.get("deletions", 0) or 0)
+        tc = int(t.get("commits", 0) or 0)
+        ta = int(t.get("additions", 0) or 0)
+        td = int(t.get("deletions", 0) or 0)
+        trend = comparison.get("trend", "常规迭代")
+        trend_icon = _TREND_ICON.get(trend, "🔁")
+
+        lines.append("📈 相比昨天")
+        lines.append(f"  【昨日】{yc} 次提交 · +{ya} / -{yd}")
+        lines.append(f"  【今日】{tc} 次提交 · +{ta} / -{td}")
+        c_summary = (comparison.get("summary") or "").strip()
+        if c_summary:
+            lines.append("")
+            for wl in _wrap_text(c_summary, "  🔄 "):
+                lines.append(wl)
+        for ch in (comparison.get("changes") or []):
+            ch = (ch or "").strip()
+            if ch:
+                lines.append(f"  · {ch}")
+        lines.append(f"  {trend_icon} 趋势：{trend}")
+        lines.append("")
+
     if action_items:
         lines.append("📌 群讨论要点")
         for item in action_items:
@@ -451,7 +486,12 @@ def _render_markdown(
                         lines.append(f"  {idx:02d}. {full_ts} · {msg}{tag_str}")
                         lines.append(f"      {sha}")
                         if ai_summary:
-                            for wl in _wrap_text(ai_summary, "      💬 ", width=78):
+                            for wl in _wrap_text(
+                                ai_summary,
+                                "      💬 ",
+                                width=78,
+                                cont_indent="         ",   # 9 空格，对齐到 💬 后
+                            ):
                                 lines.append(wl)
                         lines.append("")
                         lines.append("      文件                              增 / 删           状态")
@@ -495,8 +535,7 @@ def _render_markdown(
     if events:
         lines.append("─" * 58)
         lines.append("📢 今日 GitHub 公开活动")
-        for e in sorted(events,
-                        key=lambda x: getattr(x, "timestamp", None) or datetime.min):
+        for e in sorted(events, key=lambda x: getattr(x, "timestamp", None) or datetime.min):
             ts = _fmt_time(getattr(e, "timestamp", None))
             s_text = getattr(e, "summary", "")
             lines.append(f"   {ts}   {s_text}")
@@ -527,6 +566,7 @@ def _render_html(
     highlights: list[str] | None = None,
     action_items: list[dict] | None = None,
     commit_summaries: dict[str, str] | None = None,
+    comparison: dict | None = None,
 ) -> str:
     events = events or []
     feishu_messages = feishu_messages or []
@@ -622,14 +662,11 @@ def _render_html(
     p.append("</table></div>")
 
     if skipped:
-        p.append(
-            "<div style='background:#f5f5f5;border-radius:6px;padding:8px 14px;"
-            "margin:8px 0;font-size:13px;color:#666;'>"
-            f"🧹 消息过滤：共收到 <b>{total_msgs}</b> 条，"
-            f"保留 <b>{kept}</b> 条，"
-            f"过滤 <b>{skipped}</b> 条（撤回 / @某人 / 太短 / 系统消息）"
-            "</div>"
-        )
+        p.append("<div style='background:#f5f5f5;border-radius:6px;padding:8px 14px;"
+                 "margin:8px 0;font-size:13px;color:#666;'>"
+                 f"🧹 消息过滤：共收到 <b>{total_msgs}</b> 条，"
+                 f"保留 <b>{kept}</b> 条，"
+                 f"过滤 <b>{skipped}</b> 条（撤回 / @某人 / 太短 / 系统消息）</div>")
 
     if highlights:
         p.append("<div style='background:#eef4ff;border-left:4px solid #4a6cf7;"
@@ -650,6 +687,53 @@ def _render_html(
                 p.append(f"<p style='margin:4px 0;color:#333;'>{para}</p>")
         p.append("</div>")
 
+    # 相比昨天
+    if comparison:
+        y = comparison.get("yesterday", {}) or {}
+        t = comparison.get("today", {}) or {}
+        trend = comparison.get("trend", "常规迭代")
+        trend_icon = _TREND_ICON.get(trend, "🔁")
+
+        p.append("<div style='background:#e8f5e9;border-left:4px solid #2e7d32;"
+                 "border-radius:6px;padding:12px 16px;margin:12px 0;'>")
+        p.append("<div style='font-weight:bold;margin-bottom:8px;'>📈 相比昨天</div>")
+
+        yc = int(y.get("commits", 0) or 0)
+        ya = int(y.get("additions", 0) or 0)
+        yd = int(y.get("deletions", 0) or 0)
+        tc = int(t.get("commits", 0) or 0)
+        ta = int(t.get("additions", 0) or 0)
+        td = int(t.get("deletions", 0) or 0)
+
+        p.append("<table style='font-size:13px;border-collapse:collapse;margin-bottom:8px;'>")
+        p.append(f"<tr><td style='padding:2px 12px 2px 0;color:#666;'>昨日</td>"
+                 f"<td>{yc} 次提交 · "
+                 f"<span style='color:#2e7d32;'>+{ya}</span> / "
+                 f"<span style='color:#c62828;'>-{yd}</span></td></tr>")
+        p.append(f"<tr><td style='padding:2px 12px 2px 0;color:#666;'>今日</td>"
+                 f"<td>{tc} 次提交 · "
+                 f"<span style='color:#2e7d32;'>+{ta}</span> / "
+                 f"<span style='color:#c62828;'>-{td}</span></td></tr>")
+        p.append("</table>")
+
+        c_summary = (comparison.get("summary") or "").strip()
+        if c_summary:
+            p.append(f"<p style='margin:6px 0;color:#1b5e20;'>"
+                     f"<b>🔄 变化：</b>{esc(c_summary)}</p>")
+
+        changes = comparison.get("changes") or []
+        if changes:
+            p.append("<ul style='margin:6px 0;padding-left:20px;color:#333;'>")
+            for ch in changes:
+                ch = (ch or "").strip()
+                if ch:
+                    p.append(f"<li style='margin:3px 0;'>{esc(ch)}</li>")
+            p.append("</ul>")
+
+        p.append(f"<p style='margin:6px 0 0 0;font-size:13px;color:#2e7d32;'>"
+                 f"<b>{trend_icon} 趋势：</b>{esc(trend)}</p>")
+        p.append("</div>")
+
     # 群讨论要点
     if action_items:
         p.append("<div style='background:#f5f0ff;border-left:4px solid #8b5cf6;"
@@ -660,10 +744,8 @@ def _render_html(
             icon, label = _ACTION_LABEL.get(item.get("type", ""), ("·", ""))
             text = esc(item.get("text", "") or "")
             if text:
-                p.append(
-                    f"<li style='margin:4px 0;'>{esc(icon)} "
-                    f"<b style='color:#8b5cf6;'>【{esc(label)}】</b>{text}</li>"
-                )
+                p.append(f"<li style='margin:4px 0;'>{esc(icon)} "
+                         f"<b style='color:#8b5cf6;'>【{esc(label)}】</b>{text}</li>")
         p.append("</ul></div>")
 
     if new_files:
@@ -672,13 +754,11 @@ def _render_html(
         p.append("<table style='font-size:13px;border-collapse:collapse;width:100%;'>")
         for nf in new_files:
             icon = _file_icon(nf["filename"])
-            p.append(
-                f"<tr><td style='padding:2px 8px 2px 0;'>"
-                f"{esc(icon)} <code>{esc(nf['filename'])}</code></td>"
-                f"<td style='padding:2px 8px;text-align:right;color:#2e7d32;'>+{nf['additions']}</td>"
-                f"<td style='padding:2px 8px;text-align:right;color:#c62828;'>-{nf['deletions']}</td>"
-                "</tr>"
-            )
+            p.append(f"<tr><td style='padding:2px 8px 2px 0;'>"
+                     f"{esc(icon)} <code>{esc(nf['filename'])}</code></td>"
+                     f"<td style='padding:2px 8px;text-align:right;color:#2e7d32;'>+{nf['additions']}</td>"
+                     f"<td style='padding:2px 8px;text-align:right;color:#c62828;'>-{nf['deletions']}</td>"
+                     "</tr>")
         p.append("</table></div>")
 
     if deleted_files:
@@ -687,13 +767,11 @@ def _render_html(
         p.append("<table style='font-size:13px;border-collapse:collapse;width:100%;'>")
         for df in deleted_files:
             icon = _file_icon(df["filename"])
-            p.append(
-                f"<tr><td style='padding:2px 8px 2px 0;'>"
-                f"{esc(icon)} <code>{esc(df['filename'])}</code></td>"
-                f"<td style='padding:2px 8px;text-align:right;color:#2e7d32;'>+{df['additions']}</td>"
-                f"<td style='padding:2px 8px;text-align:right;color:#c62828;'>-{df['deletions']}</td>"
-                "</tr>"
-            )
+            p.append(f"<tr><td style='padding:2px 8px 2px 0;'>"
+                     f"{esc(icon)} <code>{esc(df['filename'])}</code></td>"
+                     f"<td style='padding:2px 8px;text-align:right;color:#2e7d32;'>+{df['additions']}</td>"
+                     f"<td style='padding:2px 8px;text-align:right;color:#c62828;'>-{df['deletions']}</td>"
+                     "</tr>")
         p.append("</table></div>")
 
     if total_commits > 0:
@@ -704,12 +782,10 @@ def _render_html(
             r_files = sum(int(getattr(c, "files_changed", 0) or 0) for c in repo_commits)
 
             p.append(f"<h2 style='color:#4a6cf7;margin-top:24px;'>📦 {esc(repo)}</h2>")
-            p.append(
-                f"<div style='color:#666;font-size:14px;margin-bottom:10px;'>"
-                f"{len(repo_commits)} 次提交 · {r_files} 个文件 · "
-                f"<span style='color:#2e7d32;'>+{r_add}</span> / "
-                f"<span style='color:#c62828;'>-{r_del}</span></div>"
-            )
+            p.append(f"<div style='color:#666;font-size:14px;margin-bottom:10px;'>"
+                     f"{len(repo_commits)} 次提交 · {r_files} 个文件 · "
+                     f"<span style='color:#2e7d32;'>+{r_add}</span> / "
+                     f"<span style='color:#c62828;'>-{r_del}</span></div>")
 
             for m in members:
                 member_commits = [c for c in (getattr(m, "commits", []) or [])
@@ -720,14 +796,12 @@ def _render_html(
                 m_add = sum(int(getattr(c, "additions", 0) or 0) for c in member_commits)
                 m_del = sum(int(getattr(c, "deletions", 0) or 0) for c in member_commits)
 
-                p.append(
-                    f"<h3 style='margin-top:20px;'>👤 {esc(m.name)}"
-                    f" <code style='font-weight:normal;color:#666;'>({esc(m.github_username)})</code>"
-                    f" <span style='font-weight:normal;font-size:14px;color:#666;'>·"
-                    f" {len(member_commits)} 次提交 · "
-                    f"<span style='color:#2e7d32;'>+{m_add}</span> / "
-                    f"<span style='color:#c62828;'>-{m_del}</span></span></h3>"
-                )
+                p.append(f"<h3 style='margin-top:20px;'>👤 {esc(m.name)}"
+                         f" <code style='font-weight:normal;color:#666;'>({esc(m.github_username)})</code>"
+                         f" <span style='font-weight:normal;font-size:14px;color:#666;'>·"
+                         f" {len(member_commits)} 次提交 · "
+                         f"<span style='color:#2e7d32;'>+{m_add}</span> / "
+                         f"<span style='color:#c62828;'>-{m_del}</span></span></h3>")
 
                 buckets = {"morning": [], "afternoon": [], "evening": []}
                 for c in member_commits:
@@ -758,11 +832,9 @@ def _render_html(
                         tag = _commit_type_tag(getattr(c, "message", "") or "")
                         tag_html = ""
                         if tag:
-                            tag_html = (
-                                f" <span style='background:#eef4ff;color:#4a6cf7;"
-                                f"padding:1px 8px;border-radius:10px;font-size:12px;'>"
-                                f"{esc(tag)}</span>"
-                            )
+                            tag_html = (f" <span style='background:#eef4ff;color:#4a6cf7;"
+                                        f"padding:1px 8px;border-radius:10px;font-size:12px;'>"
+                                        f"{esc(tag)}</span>")
                         sha = esc(_short_sha(getattr(c, "sha", "")))
                         additions = int(getattr(c, "additions", 0) or 0)
                         deletions = int(getattr(c, "deletions", 0) or 0)
@@ -774,81 +846,66 @@ def _render_html(
                         p.append(f"<div><b>{idx:02d}. {full_ts} · {msg}</b>{tag_html}</div>")
                         p.append(f"<div style='color:#888;font-size:13px;margin:4px 0;'><code>{sha}</code></div>")
 
-                        # ⭐ diff 摘要
                         if ai_summary:
-                            p.append(
-                                "<div style='background:#eef4ff;border-left:3px solid #93b4ff;"
-                                "padding:6px 10px;margin:8px 0;border-radius:4px;"
-                                "font-size:13px;color:#333;'>"
-                                f"💬 {esc(ai_summary)}</div>"
-                            )
+                            p.append("<div style='background:#eef4ff;border-left:3px solid #93b4ff;"
+                                     "padding:6px 10px;margin:8px 0;border-radius:4px;"
+                                     "font-size:13px;color:#333;'>"
+                                     f"💬 {esc(ai_summary)}</div>")
 
                         p.append("<table style='border-collapse:collapse;width:100%;font-size:13px;margin:6px 0;'>")
-                        p.append(
-                            "<tr style='color:#666;'>"
-                            "<th style='text-align:left;padding:3px 8px 3px 0;'>文件</th>"
-                            "<th style='text-align:right;padding:3px 8px;'>增</th>"
-                            "<th style='text-align:right;padding:3px 8px;'>删</th>"
-                            "<th style='text-align:center;padding:3px 8px;'>状态</th>"
-                            "</tr>"
-                        )
+                        p.append("<tr style='color:#666;'>"
+                                 "<th style='text-align:left;padding:3px 8px 3px 0;'>文件</th>"
+                                 "<th style='text-align:right;padding:3px 8px;'>增</th>"
+                                 "<th style='text-align:right;padding:3px 8px;'>删</th>"
+                                 "<th style='text-align:center;padding:3px 8px;'>状态</th>"
+                                 "</tr>")
                         for fd in _commit_files(c):
                             fname = getattr(fd, "filename", "") or "?"
                             add = int(getattr(fd, "additions", 0) or 0)
                             dele = int(getattr(fd, "deletions", 0) or 0)
                             status_cn = _status_cn(getattr(fd, "status", "modified"))
                             icon = _file_icon(fname)
-                            p.append(
-                                f"<tr><td style='padding:2px 8px 2px 0;'>"
-                                f"{esc(icon)} <code>{esc(fname)}</code></td>"
-                                f"<td style='padding:2px 8px;text-align:right;color:#2e7d32;'>+{add}</td>"
-                                f"<td style='padding:2px 8px;text-align:right;color:#c62828;'>-{dele}</td>"
-                                f"<td style='padding:2px 8px;text-align:center;color:#666;'>{esc(status_cn)}</td>"
-                                "</tr>"
-                            )
-                        p.append(
-                            f"<tr><td style='padding:4px 8px 4px 0;color:#666;"
-                            f"font-weight:bold;'>小计</td>"
-                            f"<td style='padding:4px 8px;text-align:right;color:#2e7d32;"
-                            f"font-weight:bold;'>+{additions}</td>"
-                            f"<td style='padding:4px 8px;text-align:right;color:#c62828;"
-                            f"font-weight:bold;'>-{deletions}</td>"
-                            "<td></td></tr>"
-                            "</table>"
-                        )
+                            p.append(f"<tr><td style='padding:2px 8px 2px 0;'>"
+                                     f"{esc(icon)} <code>{esc(fname)}</code></td>"
+                                     f"<td style='padding:2px 8px;text-align:right;color:#2e7d32;'>+{add}</td>"
+                                     f"<td style='padding:2px 8px;text-align:right;color:#c62828;'>-{dele}</td>"
+                                     f"<td style='padding:2px 8px;text-align:center;color:#666;'>{esc(status_cn)}</td>"
+                                     "</tr>")
+                        p.append(f"<tr><td style='padding:4px 8px 4px 0;color:#666;"
+                                 f"font-weight:bold;'>小计</td>"
+                                 f"<td style='padding:4px 8px;text-align:right;color:#2e7d32;"
+                                 f"font-weight:bold;'>+{additions}</td>"
+                                 f"<td style='padding:4px 8px;text-align:right;color:#c62828;"
+                                 f"font-weight:bold;'>-{deletions}</td>"
+                                 "<td></td></tr>"
+                                 "</table>")
                         if url:
-                            p.append(
-                                f"<div style='font-size:12px;'>"
-                                f"<a href='{esc(url)}' style='color:#4a6cf7;'>🔗 查看提交</a></div>"
-                            )
+                            p.append(f"<div style='font-size:12px;'>"
+                                     f"<a href='{esc(url)}' style='color:#4a6cf7;'>🔗 查看提交</a></div>")
                         p.append("</div>")
 
+    # 飞书群消息 —— 独立区块
     if feishu_messages:
         p.append("<hr style='border:none;border-top:1px solid #eee;margin:24px 0;'>")
-        p.append(
-            f"<h2 style='color:#10b981;margin-top:0;'>"
-            f"💬 飞书群消息（共 {len(feishu_messages)} 条）</h2>"
-        )
+        p.append(f"<h2 style='color:#10b981;margin-top:0;'>"
+                 f"💬 飞书群消息（共 {len(feishu_messages)} 条）</h2>")
         p.append("<div style='background:#f0fdf4;border-radius:6px;"
                  "padding:10px 14px;font-size:14px;'>")
         for msg in _sort_messages(feishu_messages):
             ts = _fmt_time(getattr(msg, "timestamp", None))
             sender = esc(getattr(msg, "sender_name", "") or "未知")
             text = esc(getattr(msg, "text", "") or "")
-            p.append(
-                f"<div style='margin:6px 0;padding:6px 0;"
-                f"border-bottom:1px dashed #d1fae5;'>"
-                f"<code style='color:#059669;'>{esc(ts)}</code> "
-                f"<b>{sender}</b>：{text}</div>"
-            )
+            p.append(f"<div style='margin:6px 0;padding:6px 0;"
+                     f"border-bottom:1px dashed #d1fae5;'>"
+                     f"<code style='color:#059669;'>{esc(ts)}</code> "
+                     f"<b>{sender}</b>：{text}</div>")
         p.append("</div>")
 
     if events:
         p.append("<hr style='border:none;border-top:1px solid #eee;margin:20px 0;'>")
         p.append("<h3>📢 今日 GitHub 公开活动</h3>")
         p.append("<ul style='font-size:14px;color:#333;'>")
-        for e in sorted(events,
-                        key=lambda x: getattr(x, "timestamp", None) or datetime.min):
+        for e in sorted(events, key=lambda x: getattr(x, "timestamp", None) or datetime.min):
             ts = _fmt_time(getattr(e, "timestamp", None))
             s_text = esc(getattr(e, "summary", ""))
             url = getattr(e, "url", "") or ""
@@ -882,19 +939,20 @@ def generate(
     feishu_stats: dict | None = None,
     yesterday_stats: dict | None = None,
     highlights: list[str] | None = None,
-    action_items: list[dict] | None = None,          # ⭐ 新增
-    commit_summaries: dict[str, str] | None = None,   # ⭐ 新增
+    action_items: list[dict] | None = None,
+    commit_summaries: dict[str, str] | None = None,
+    comparison: dict | None = None,
 ) -> Report:
     generated_at = generated_at or datetime.now()
     md = _render_markdown(
         members, report_date, team_name, events, feishu_messages,
         summary, generated_at, feishu_stats, yesterday_stats, highlights,
-        action_items, commit_summaries,
+        action_items, commit_summaries, comparison,
     )
     html = _render_html(
         members, report_date, team_name, events, feishu_messages,
         summary, generated_at, feishu_stats, yesterday_stats, highlights,
-        action_items, commit_summaries,
+        action_items, commit_summaries, comparison,
     )
     return Report(
         date=report_date,
