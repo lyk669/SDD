@@ -1,0 +1,45 @@
+team_name: Dev Team
+
+schedule:
+  hour: 18
+  minute: 0
+  skip_weekends: false
+  holidays: []
+
+github:
+  token_env: GITHUB_TOKEN
+  branch: master
+  repos:
+    - lyk669/smart-daily-report-system-hw
+
+lark:
+  app_id_env: LARK_APP_ID
+  app_secret_env: LARK_APP_SECRET
+  tasklist_id: ""
+  target_chat_id: oc_90a167bb9750319808b1bf1c3f30d91e
+  notify_chat_id: oc_90a167bb9750319808b1bf1c3f30d91e
+
+email:
+  smtp_host: smtp.qq.com
+  smtp_port: 465
+  use_ssl: true
+  username_env: SMTP_USERNAME
+  password_env: SMTP_PASSWORD
+  from_addr: 2327929235@qq.com
+  sender_name: 刘雨可
+  subject_prefix: ""                    # ← 清空（不再用旧格式）
+  subject_grade: 研一                    # ← 新增：年级
+  subject_name: 刘雨可       
+  recipients:
+    - 1730173019@qq.com
+    - 470765757@qq.com
+
+
+storage:
+  db_path: data/daily_reports.db
+
+members:
+  - name: 刘雨可
+    github: lyk669
+    lark: 刘雨可
+ 

@@ -1,20 +1,24 @@
-"""智能日报生成器 — 主编排入口。
+"""智能日报生成器 — 主编排入口（v3.0 支持用户输入 + 自学习）。
 
 用法:
-  python main.py                    # 完整流程：采集 → 生成 → 推送
-  python main.py --auto             # 一键自动：采集全部数据源，生成并发送
-  python main.py --check            # 健康检查
-  python main.py --dry-run          # 采集+生成，不推送
-  python main.py --github-only      # 只采集 GitHub，跳过飞书
+  python main.py                              # 完整流程
+  python main.py --auto                       # 一键自动
+  python main.py --auto --dry-run             # 采集+生成，不推送
+  python main.py --auto --reflect "..." --plan "..."   # 带用户反思
+  python main.py --auto --interactive         # 交互式输入反思
+  python main.py --check                      # 健康检查
 """
 
 from __future__ import annotations
 
 import argparse
+import os
+import re
 import sys
 import time as _time
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 from collector import feishu_message as feishu_message_collector
@@ -27,7 +31,9 @@ from generator.summarizer import (
     compare_with_yesterday,
     extract_action_items,
     extract_highlights,
-    generate_suggestions,
+    generate_next_plan,
+    generate_problems,
+    generate_risks,
     summarize,
     summarize_commits,
 )
@@ -50,6 +56,7 @@ logger = get_logger("daily_report.main")
 
 FALLBACK_RECIPIENTS: list[str] = ["2327929235@qq.com"]
 DEFAULT_SUBJECT_PREFIX = "刘雨可—智能日报"
+DEFAULT_MANUAL_FILE = "manual_input.md"
 
 EMAIL_MAX_RETRIES = 2
 EMAIL_RETRY_INTERVAL = 5
@@ -81,8 +88,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="一键自动：采集全部数据源，生成并发送")
     parser.add_argument("--to", action="append", default=None,
                         help="临时指定收件人邮箱，可重复")
+    # 用户输入
+    parser.add_argument("--reflect", default=None,
+                        help="今日反思（多行用 \\n 分隔），覆盖 AI 草稿")
+    parser.add_argument("--plan", default=None,
+                        help="明日计划（多行用 \\n 分隔），覆盖 AI 草稿")
+    parser.add_argument("--interactive", action="store_true",
+                        help="交互式输入反思与计划")
+    parser.add_argument("--manual-file", default=DEFAULT_MANUAL_FILE,
+                        help="手动输入文件路径（默认 manual_input.md）")
     return parser.parse_args(argv)
 
+
+# ============ 时间 / 窗口 ============
 
 def collection_window(now=None, lookback_days=1):
     now = now or datetime.now(LOCAL_TZ)
@@ -104,6 +122,147 @@ def is_workday(cfg, day=None) -> bool:
         return False
     return True
 
+
+# ============ 用户输入 ============
+
+def _parse_multiline_text(text: str) -> list[str]:
+    """把一段多行文本拆成多条（跳过空行、去掉列表前缀）。"""
+    if not text:
+        return []
+    out = []
+    for line in text.split("\n"):
+        s = line.strip()
+        if not s:
+            continue
+        # 去掉 markdown 列表前缀
+        s = re.sub(r"^[-*·•]\s+", "", s)
+        s = re.sub(r"^\d+[.、)]\s+", "", s)
+        if s:
+            out.append(s)
+    return out
+
+
+def _parse_manual_file(path: str, today: date) -> dict | None:
+    """解析 manual_input.md。
+
+    返回 {"reflect": [...], "plan": [...], "date": "..."} 或 None。
+    """
+    p = Path(path)
+    if not p.exists():
+        return None
+
+    try:
+        content = p.read_text(encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"读手动输入文件失败: {exc}")
+        return None
+
+    # 检查文件第一行日期（# 2026-10-13），若不是今天则忽略
+    lines = content.split("\n")
+    file_date = None
+    for line in lines[:5]:
+        m = re.search(r"(\d{4}-\d{2}-\d{2})", line)
+        if m:
+            file_date = m.group(1)
+            break
+    if file_date and file_date != today.isoformat():
+        logger.info(f"手动输入文件日期({file_date})不是今天，忽略")
+        return None
+
+    # 按 ## 章节拆
+    sections: dict[str, list[str]] = {}
+    cur_key = None
+    for line in lines:
+        if line.startswith("## "):
+            title = line[3:].strip()
+            cur_key = title
+            sections[cur_key] = []
+        elif cur_key is not None:
+            sections[cur_key].append(line)
+
+    reflect_lines: list[str] = []
+    plan_lines: list[str] = []
+    for title, body in sections.items():
+        t = title.lower()
+        text = "\n".join(body)
+        if "反思" in title or "问题" in title or "reflect" in t:
+            reflect_lines.extend(_parse_multiline_text(text))
+        elif "计划" in title or "明日" in title or "plan" in t:
+            plan_lines.extend(_parse_multiline_text(text))
+
+    if not reflect_lines and not plan_lines:
+        return None
+
+    return {
+        "date": today.isoformat(),
+        "reflect": reflect_lines,
+        "plan": plan_lines,
+    }
+
+
+def _prompt_multiline(title: str) -> list[str]:
+    """交互式多行输入，输入 END 结束。"""
+    print()
+    print(f"===== {title} =====")
+    print("（多行输入，空行会被忽略，输入 END 单独一行结束）")
+    lines: list[str] = []
+    while True:
+        try:
+            line = input("> ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if line.strip().upper() == "END":
+            break
+        s = line.strip()
+        if s:
+            lines.append(s)
+    return lines
+
+
+def _collect_user_input(
+    args,
+    today: date,
+) -> dict:
+    """收集用户输入。
+
+    优先级：命令行 > 交互式 > 文件 > 无。
+    返回 {"reflect": [...], "plan": [...], "source": "cli|interactive|file|none"}
+    """
+    # 1. 命令行
+    cli_reflect = _parse_multiline_text(args.reflect or "")
+    cli_plan = _parse_multiline_text(args.plan or "")
+    if cli_reflect or cli_plan:
+        logger.info(f"使用命令行输入：反思 {len(cli_reflect)} 条，计划 {len(cli_plan)} 条")
+        return {"reflect": cli_reflect, "plan": cli_plan, "source": "cli"}
+
+    # 2. 交互式
+    if args.interactive:
+        r = _prompt_multiline("今日反思（问题与思考）")
+        p = _prompt_multiline("明日计划")
+        if r or p:
+            logger.info(f"使用交互式输入：反思 {len(r)} 条，计划 {len(p)} 条")
+            return {"reflect": r, "plan": p, "source": "interactive"}
+
+    # 3. 本地文件
+    file_data = _parse_manual_file(args.manual_file, today)
+    if file_data:
+        r = file_data.get("reflect") or []
+        p = file_data.get("plan") or []
+        if r or p:
+            logger.info(f"使用文件输入（{args.manual_file}）：反思 {len(r)} 条，计划 {len(p)} 条")
+            return {"reflect": r, "plan": p, "source": "file"}
+
+    # 4. 无
+    return {"reflect": [], "plan": [], "source": "none"}
+
+
+def _to_problems_list(texts: list[str], tag: str) -> list[dict]:
+    """把字符串列表转成 [{"text": ..., "tag": ...}]。"""
+    return [{"text": t, "tag": tag} for t in texts if t and t.strip()]
+
+
+# ============ 成员聚合 ============
 
 def _build_open_id_name_map(cfg) -> dict[str, str]:
     mapping: dict[str, str] = {}
@@ -196,6 +355,8 @@ def aggregate_members(cfg, commits, tasks) -> list[MemberReport]:
     return members
 
 
+# ============ 采集 ============
+
 def run_collect(cfg, since, until, *, github_only=False):
     github_token = None
     try:
@@ -275,9 +436,10 @@ def run_collect_feishu_messages(cfg, since, until):
         return CollectResult(success=False, records=[], error_message=str(exc))
 
 
+# ============ 健康检查 ============
+
 def run_check(cfg) -> int:
     import httpx
-    import os
     from collector.lark_task import LarkTokenProvider
 
     ok = True
@@ -295,6 +457,7 @@ def run_check(cfg) -> int:
 
     storage = ReportStorage(cfg.storage["db_path"])
     logger.info(f"[check] SQLite OK: {storage.db_path}")
+    logger.info(f"[check] 日报总数: {storage.count_reports()}")
     logger.info(f"[check] members={len(cfg.members)}, repos={cfg.github['repos']}")
     logger.info(f"[check] recipients: {_resolve_recipients(cfg)}")
     logger.info(f"[check] sender_name: {cfg.email.get('sender_name') or '(未配置)'}")
@@ -302,6 +465,8 @@ def run_check(cfg) -> int:
     logger.info(f"[check] 飞书消息采集群: {cfg.lark.get('target_chat_id') or '(未配置)'}")
     logger.info(f"[check] 飞书日报推送群: {cfg.lark.get('notify_chat_id') or '(未配置，不推送)'}")
     logger.info(f"[check] DeepSeek: {'已配置' if os.environ.get('DEEPSEEK_API_KEY') else '(未配置)'}")
+    logger.info(f"[check] 手动输入文件: {DEFAULT_MANUAL_FILE} "
+                f"({'存在' if Path(DEFAULT_MANUAL_FILE).exists() else '不存在'})")
 
     try:
         app_id, app_secret = cfg.lark_credentials()
@@ -333,6 +498,8 @@ def run_check(cfg) -> int:
     return 0 if ok else 1
 
 
+# ============ Pipeline ============
+
 @dataclass
 class PipelineOutcome:
     code: int
@@ -348,8 +515,13 @@ class PipelineOutcome:
     action_items: list[dict] = field(default_factory=list)
     commit_summaries: dict[str, str] = field(default_factory=dict)
     comparison: dict = field(default_factory=dict)
-    suggestions: list[dict] = field(default_factory=list)
     work_classification: dict = field(default_factory=dict)
+    risks: list[dict] = field(default_factory=list)
+    problems: list[dict] = field(default_factory=list)
+    next_plan: list[dict] = field(default_factory=list)
+    ai_problems: list[dict] = field(default_factory=list)
+    ai_next_plan: list[dict] = field(default_factory=list)
+    reflection_source: str = "ai"
     issue_number: int = 0
     sender: str = ""
     recipients: list[str] = field(default_factory=list)
@@ -428,10 +600,6 @@ def _resolve_recipients(cfg, override=None) -> list[str]:
 
 
 def _build_subject(cfg, report_date) -> str:
-    """构造邮件标题：研一+姓名+日期+智能日报。
-
-    例如：研一刘雨可2026-10-13智能日报
-    """
     grade = cfg.email.get("subject_grade") or "研一"
     name = cfg.email.get("subject_name") or cfg.email.get("sender_name") or "刘雨可"
     date_str = report_date.strftime("%Y-%m-%d")
@@ -497,7 +665,8 @@ def _send_feishu_with_report(cfg, report, members, highlights, summary, subject)
 
 
 def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
-                     github_only=False, recipients_override=None) -> PipelineOutcome:
+                     github_only=False, recipients_override=None,
+                     user_input: dict | None = None) -> PipelineOutcome:
     started = datetime.now(LOCAL_TZ)
     logger.info(f"日报任务开始: {started.isoformat()}")
 
@@ -532,28 +701,27 @@ def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
 
     members = aggregate_members(cfg, commits, tasks)
 
-    # ── 读历史 ──
+    # 读历史
     storage = ReportStorage(cfg.storage["db_path"])
     yesterday_stats = storage.get_yesterday_stats(until.date())
     if yesterday_stats:
         logger.info(f"读到昨日统计: {yesterday_stats}")
-    else:
-        logger.info("无昨日统计数据，跳过数字对比")
-
     yesterday_payload = storage.get_payload_by_date(until.date() - timedelta(days=1))
-    if yesterday_payload:
-        logger.info("读到昨日完整日报，可做变化分析")
-    else:
-        logger.info("无昨日完整日报")
 
-    # ── issue_number：SQLite 里日报总条数 + 1 ──
+    # 期数
     try:
         issue_number = storage.count_reports() + 1
     except Exception:  # noqa: BLE001
         issue_number = 0
     logger.info(f"日报期数: 第 {issue_number} 期" if issue_number else "未取到期数")
 
-    # ── LLM 分析 ──
+    # 读近 7 天反思（用于 LLM 学习风格）
+    recent_reflections = storage.get_recent_reflections(
+        days=7, end_date=until.date(), only_user_written=True,
+    )
+    logger.info(f"近 7 天用户真实反思: {len(recent_reflections)} 天")
+
+    # ====== LLM 分析 ======
     summary = summarize(members, feishu_msgs, until.date()) or ""
     highlights = extract_highlights(members, feishu_msgs, until.date(), top_n=3)
     action_items = extract_action_items(members, feishu_msgs, until.date(), max_items=5)
@@ -563,14 +731,73 @@ def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
         members, summary, highlights, yesterday_payload, until.date(),
     ) or {}
 
-    suggestions = generate_suggestions(
-        members, feishu_msgs, commit_summaries, yesterday_payload,
-        until.date(), max_items=3,
-    ) or []
-
     work_classification = classify_work(members, commit_summaries, until.date()) or {}
 
-    # ── 生成日报 ──
+    risks = generate_risks(
+        members, feishu_msgs, commit_summaries, work_classification,
+        yesterday_payload, until.date(),
+    ) or []
+
+    # ====== AI 草稿：问题与思考 + 明日计划 ======
+    ai_problems = generate_problems(
+        members, feishu_msgs, action_items, risks,
+        yesterday_payload, until.date(),
+        recent_reflections=recent_reflections,
+        max_items=5,
+    ) or []
+
+    ai_next_plan = generate_next_plan(
+        members, feishu_msgs, action_items, risks,
+        yesterday_payload, until.date(),
+        recent_reflections=recent_reflections,
+        max_items=4,
+    ) or []
+
+    logger.info(f"AI 草稿：问题 {len(ai_problems)} 条，计划 {len(ai_next_plan)} 条")
+
+    # ====== 用户输入覆盖 ======
+    if user_input is None:
+        user_input = {"reflect": [], "plan": [], "source": "none"}
+
+    user_reflect = user_input.get("reflect") or []
+    user_plan = user_input.get("plan") or []
+
+    # 最终版问题
+    if user_reflect:
+        problems = _to_problems_list(user_reflect, "用户输入")
+        logger.info(f"用户输入覆盖问题（{len(problems)} 条）")
+    else:
+        problems = ai_problems
+
+    # 最终版计划
+    if user_plan:
+        next_plan = _to_problems_list(user_plan, "用户输入")
+        logger.info(f"用户输入覆盖计划（{len(next_plan)} 条）")
+    else:
+        next_plan = ai_next_plan
+
+    # 来源标记
+    if user_reflect and user_plan:
+        reflection_source = "manual"
+    elif user_reflect or user_plan:
+        reflection_source = "hybrid"
+    else:
+        reflection_source = "ai"
+
+    # ====== 存反思到 SQLite ======
+    try:
+        storage.save_reflection(
+            report_date=until.date(),
+            problems=problems,
+            next_plan=next_plan,
+            ai_problems=ai_problems,
+            ai_next_plan=ai_next_plan,
+            source=reflection_source,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"保存反思失败: {exc}")
+
+    # ====== 生成日报 ======
     report = generate(
         members, until.date(), cfg.team_name,
         events=events_records,
@@ -581,9 +808,15 @@ def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
         action_items=action_items,
         commit_summaries=commit_summaries,
         comparison=comparison,
-        suggestions=suggestions,
         work_classification=work_classification,
         issue_number=issue_number,
+        risks=risks,
+        problems=problems,
+        next_plan=next_plan,
+        ai_problems=ai_problems,
+        ai_next_plan=ai_next_plan,
+        reflection_source=reflection_source,
+        tasks=tasks,
         summary=summary,
         generated_at=started,
     )
@@ -596,8 +829,13 @@ def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
         "action_items": action_items,
         "commit_summaries": commit_summaries,
         "comparison": comparison,
-        "suggestions": suggestions,
         "work_classification": work_classification,
+        "risks": risks,
+        "problems": problems,
+        "next_plan": next_plan,
+        "ai_problems": ai_problems,
+        "ai_next_plan": ai_next_plan,
+        "reflection_source": reflection_source,
         "issue_number": issue_number,
         "members": [
             {"name": m.name, "github_username": m.github_username,
@@ -621,9 +859,8 @@ def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
     if dry_run:
         logger.info("dry-run 模式，跳过推送")
         logger.info(f"邮件主题: {subject}")
-        logger.info(f"发件人: {sender}")
         logger.info(f"收件人: {recipients}")
-        logger.info(f"飞书推送群: {cfg.lark.get('notify_chat_id') or '(未配置)'}")
+        logger.info(f"反思来源: {reflection_source}")
         logger.info(f"日报任务结束: {(datetime.now(LOCAL_TZ) - started)}")
         return PipelineOutcome(
             code=0, report_id=report_id,
@@ -633,8 +870,10 @@ def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
             highlights=highlights, action_items=action_items,
             commit_summaries=commit_summaries,
             comparison=comparison,
-            suggestions=suggestions,
             work_classification=work_classification,
+            risks=risks, problems=problems, next_plan=next_plan,
+            ai_problems=ai_problems, ai_next_plan=ai_next_plan,
+            reflection_source=reflection_source,
             issue_number=issue_number,
             sender=sender, recipients=recipients,
         )
@@ -666,8 +905,10 @@ def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
         highlights=highlights, action_items=action_items,
         commit_summaries=commit_summaries,
         comparison=comparison,
-        suggestions=suggestions,
         work_classification=work_classification,
+        risks=risks, problems=problems, next_plan=next_plan,
+        ai_problems=ai_problems, ai_next_plan=ai_next_plan,
+        reflection_source=reflection_source,
         issue_number=issue_number,
         sender=sender, recipients=recipients,
         email_sent=email_ok, feishu_sent=feishu_ok,
@@ -675,23 +916,13 @@ def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
 
 
 def run_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
-                 github_only=False, recipients_override=None) -> int:
+                 github_only=False, recipients_override=None,
+                 user_input=None) -> int:
     return execute_pipeline(
         cfg, dry_run=dry_run, force=force, lookback_days=lookback_days,
         github_only=github_only, recipients_override=recipients_override,
+        user_input=user_input,
     ).code
-
-
-def run_auto(config_path: str = "config.yaml", recipients=None) -> PipelineOutcome:
-    setup_logger()
-    try:
-        from dotenv import load_dotenv
-        load_dotenv()
-    except ImportError:
-        pass
-    cfg = load_config(config_path)
-    return execute_pipeline(cfg, dry_run=False, force=True, github_only=False,
-                            lookback_days=1, recipients_override=recipients)
 
 
 def main(argv=None) -> int:
@@ -712,15 +943,23 @@ def main(argv=None) -> int:
     if args.check:
         return run_check(cfg)
 
+    # 收集用户输入
+    today = datetime.now(LOCAL_TZ).date()
+    user_input = _collect_user_input(args, today)
+
     if args.auto:
         outcome = execute_pipeline(
             cfg, dry_run=args.dry_run, force=True, github_only=False,
             lookback_days=1, recipients_override=args.to,
+            user_input=user_input,
         )
         return outcome.code
 
-    return run_pipeline(cfg, dry_run=args.dry_run, force=args.force,
-                        github_only=args.github_only, recipients_override=args.to)
+    return run_pipeline(
+        cfg, dry_run=args.dry_run, force=args.force,
+        github_only=args.github_only, recipients_override=args.to,
+        user_input=user_input,
+    )
 
 
 if __name__ == "__main__":
