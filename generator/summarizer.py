@@ -1,4 +1,14 @@
-"""用 LLM（DeepSeek）生成日报的各类分析。"""
+"""用 LLM（DeepSeek）生成日报的各类分析。
+
+包含：
+  1. summarize             今日总结段落
+  2. extract_highlights    今日亮点 Top N
+  3. extract_action_items  群讨论要点（决策 / 待办 / 问题）
+  4. summarize_commits     commit diff 摘要（读代码说人话）
+  5. compare_with_yesterday 相比昨天变化分析
+  6. generate_suggestions  工作建议（3 条）
+  7. classify_work         commit 分类统计
+"""
 
 from __future__ import annotations
 
@@ -19,6 +29,8 @@ _MODEL_ENV = "DEEPSEEK_MODEL"
 _DEFAULT_BASE_URL = "https://api.deepseek.com"
 _DEFAULT_MODEL = "deepseek-chat"
 
+
+# ---------- 通用工具 ----------
 
 def _to_local(dt: datetime) -> datetime:
     try:
@@ -42,7 +54,7 @@ def _call_llm(prompt: str, *, system: str, max_tokens: int = 600) -> str | None:
     model = os.environ.get(_MODEL_ENV, _DEFAULT_MODEL)
 
     try:
-        with httpx.Client(base_url=base_url, timeout=90.0) as client:
+        with httpx.Client(base_url=base_url, timeout=120.0) as client:
             resp = client.post(
                 "/chat/completions",
                 headers={
@@ -74,7 +86,7 @@ def _call_llm(prompt: str, *, system: str, max_tokens: int = 600) -> str | None:
 
 
 def _parse_json(text: str, kind: str = "array"):
-    """从 LLM 输出里提取 JSON（数组或对象）。"""
+    """从 LLM 输出里提取 JSON。kind: 'array' | 'object'"""
     if not text:
         return None
     t = text.strip()
@@ -95,6 +107,7 @@ def _parse_json(text: str, kind: str = "array"):
 
 
 def _build_prompt(members, feishu_messages, report_date) -> str:
+    """通用 prompt：把今天的 commit / 群消息整理成文本。"""
     lines = [f"日期：{report_date.isoformat()}（北京时间）", ""]
 
     lines.append("【代码提交】")
@@ -146,7 +159,7 @@ def summarize(members, feishu_messages, report_date) -> str | None:
         instruction = (
             "请根据以上信息，用中文写一段 3-5 句的『今日工作总结』。"
             "要求：① 语气正式；② 先说代码提交，再说群消息讨论；"
-            "③ 突出关键成果；"
+            "③ 突出关键成果，不要罗列每一条；"
             "④ 如果提到时间，请使用上面给出的时间（已经是北京时间）；"
             "⑤ 不要用 markdown；⑥ 直接输出。"
         )
@@ -304,7 +317,7 @@ def summarize_commits(members, report_date, max_commits: int = 20) -> dict[str, 
     return results
 
 
-# ============ 5. 相比昨天的变化 ⭐ 新增 ============
+# ============ 5. 相比昨天的变化 ============
 
 def compare_with_yesterday(
     today_members,
@@ -315,7 +328,8 @@ def compare_with_yesterday(
 ) -> dict | None:
     """对比昨天和今天，生成变化分析。
 
-    返回 {"summary": str, "changes": list[str], "trend": str} 或 None。
+    返回 {"summary": str, "changes": list[str], "trend": str,
+          "yesterday": {...}, "today": {...}} 或 None。
     """
     if not yesterday_payload:
         return None
@@ -423,7 +437,6 @@ def compare_with_yesterday(
         "summary": str(data.get("summary", "")).strip(),
         "changes": [str(x).strip() for x in (data.get("changes") or []) if str(x).strip()],
         "trend": str(data.get("trend", "")).strip() or "常规迭代",
-        # 数字部分一起带上，方便渲染
         "yesterday": {
             "commits": y_commits_count,
             "additions": y_add,
@@ -437,3 +450,219 @@ def compare_with_yesterday(
     }
     logger.info(f"相比昨天分析生成成功: trend={result['trend']}")
     return result
+
+
+# ============ 6. 工作建议 ⭐ 新增 ============
+
+def generate_suggestions(
+    members,
+    feishu_messages,
+    commit_summaries: dict,
+    yesterday_payload: dict | None,
+    report_date,
+    max_items: int = 3,
+) -> list[dict]:
+    """生成工作建议。返回 [{"type": "🛠 代码质量", "text": "..."}]。"""
+    api_key = os.environ.get(_API_KEY_ENV, "").strip()
+    if not api_key:
+        return []
+
+    # 收集信息
+    all_commits = [c for m in members for c in (getattr(m, "commits", None) or [])]
+    if not all_commits and not feishu_messages:
+        return []
+
+    lines = []
+    lines.append(f"日期：{report_date.isoformat()}（北京时间）")
+    lines.append("")
+
+    # commit 概要
+    lines.append("【今日代码提交】")
+    total_files = 0
+    for c in all_commits:
+        msg = (getattr(c, "message", "") or "").split("\n")[0].strip()
+        files_n = int(getattr(c, "files_changed", 0) or 0)
+        add = int(getattr(c, "additions", 0) or 0)
+        dele = int(getattr(c, "deletions", 0) or 0)
+        total_files += files_n
+        lines.append(f"- {msg}（{files_n} 个文件，+{add}/-{dele}）")
+        # 找出单文件改动最大的
+        for fd in (getattr(c, "file_details", None) or []):
+            fd_add = int(getattr(fd, "additions", 0) or 0)
+            if fd_add > 500:
+                lines.append(f"  ⚠️ {getattr(fd, 'filename', '?')} 单次 +{fd_add} 行")
+    lines.append("")
+
+    # 群消息概要
+    if feishu_messages:
+        lines.append("【今日群消息】")
+        for msg in feishu_messages[:10]:
+            sender = getattr(msg, "sender_name", "") or "未知"
+            text = (getattr(msg, "text", "") or "").strip()
+            lines.append(f"- {sender}：{text}")
+        lines.append("")
+
+    # 昨天的情况
+    if yesterday_payload:
+        y_members = yesterday_payload.get("members", []) or []
+        y_commits = sum(len(m.get("commits", [])) for m in y_members)
+        lines.append(f"【昨天情况】{y_commits} 次提交")
+        lines.append("")
+
+    instruction = (
+        f"请根据以上信息，提出 {max_items} 条今天的工作建议。"
+        "要求："
+        "① 严格输出 JSON 数组，格式："
+        '[{"type": "🛠 代码质量", "text": "..."}, '
+        '{"type": "⚠️ 待办", "text": "..."}, '
+        '{"type": "📝 内容输出", "text": "..."}]'
+        "；"
+        "② type 从这几个里选："
+        "'🛠 代码质量'、'⚠️ 待办'、'📝 内容输出'、'🎯 进度'、'🔒 风险'；"
+        "③ text 要具体、可执行，不超过 50 字；"
+        "④ 不要空话，要针对今天的数据给出具体建议；"
+        "⑤ 如果今天没什么可建议的，返回空数组；"
+        "⑥ 只输出 JSON，不要其它文字。"
+    )
+
+    content = _call_llm(
+        "\n".join(lines) + "\n" + instruction,
+        system="你是一个专业的技术团队顾问，擅长根据工作数据给出具体可执行的改进建议。",
+        max_tokens=500,
+    )
+    arr = _parse_json(content or "", "array")
+    if not isinstance(arr, list):
+        return []
+
+    result = []
+    for item in arr:
+        if not isinstance(item, dict):
+            continue
+        t = str(item.get("type", "")).strip()
+        text = str(item.get("text", "")).strip()
+        if t and text:
+            result.append({"type": t, "text": text})
+    if result:
+        logger.info(f"工作建议生成成功（{len(result)} 条）")
+    return result[:max_items]
+
+
+# ============ 7. commit 分类统计 ⭐ 新增 ============
+
+_CATEGORY_DEFS = [
+    ("feat", "🆕 新增功能"),
+    ("fix", "🐛 Bug 修复"),
+    ("refactor", "♻️ 代码重构"),
+    ("docs", "📝 文档更新"),
+    ("test", "🧪 测试"),
+    ("chore", "🔧 配置调整"),
+    ("style", "🎨 样式"),
+    ("perf", "⚡ 性能优化"),
+    ("ci", "🚀 CI/CD"),
+    ("build", "📦 构建"),
+    ("revert", "⏪ 回滚"),
+]
+
+
+def _classify_commit_message(msg: str) -> str | None:
+    """从 commit message 解析类别。返回类别 key（如 'feat'）。"""
+    if not msg:
+        return None
+    import re
+    m = msg.strip().lower()
+    m = re.sub(r"^([a-z]+)\s*\([^)]*\)\s*:", r"\1:", m)
+    for prefix, _ in _CATEGORY_DEFS:
+        if m.startswith(prefix + ":") or m.startswith(prefix + " "):
+            return prefix
+    return None
+
+
+def classify_work(members, commit_summaries: dict, report_date) -> dict:
+    """按 commit type 分类今天的提交。
+
+    返回：
+      {"categories": [
+          {"key": "feat", "label": "🆕 新增功能", "count": 3, "percent": 60,
+           "details": "飞书采集、LLM 总结、diff 摘要"},
+          ...
+      ]}
+    """
+    all_commits = [c for m in members for c in (getattr(m, "commits", None) or [])]
+    if not all_commits:
+        return {"categories": []}
+
+    # 统计
+    from collections import defaultdict
+    bucket: dict[str, list] = defaultdict(list)
+    unclassified = 0
+
+    for c in all_commits:
+        msg = (getattr(c, "message", "") or "").strip()
+        key = _classify_commit_message(msg)
+        if key is None:
+            unclassified += 1
+            continue
+        bucket[key].append(c)
+
+    total = len(all_commits)
+
+    # 用 LLM 给每类生成"详情"
+    label_map = dict(_CATEGORY_DEFS)
+    categories = []
+
+    # 如果有未分类的，加一类
+    if unclassified > 0:
+        label_map["_other"] = "📌 其他"
+        bucket["_other"] = [c for c in all_commits
+                            if _classify_commit_message(
+                                (getattr(c, "message", "") or "").strip()) is None]
+
+    # 只对有用的类调 LLM 生成详情（一次调用批量处理）
+    summary_lines = []
+    for key, items in bucket.items():
+        msgs = []
+        for c in items:
+            msg = (getattr(c, "message", "") or "").strip().splitlines()[0]
+            msgs.append(msg)
+        summary_lines.append(f"{key}: {msgs}")
+
+    details_map = {}
+    if len(bucket) > 1 or total <= 5:
+        # 只有 > 1 类时才调 LLM 生成详情（否则就是唯一类，没必要）
+        prompt = (
+            "以下是今天 commit 按类型的分组，请为每组生成一句简短的中文详情"
+            "（不超过 25 字，概括这组做了什么），用顿号分隔关键词。\n\n"
+            + "\n".join(summary_lines)
+            + "\n\n要求："
+            "① 严格输出 JSON 对象，key 是类别名，value 是详情字符串；"
+            "② 详情要具体（说功能名 / bug 名 / 模块名），不要空话；"
+            '③ 例如：{"feat": "飞书采集、LLM 总结、diff 摘要"}'
+            "；④ 只输出 JSON。"
+        )
+        content = _call_llm(
+            prompt,
+            system="你是一个代码分析助手，擅长用关键词概括一组改动。",
+            max_tokens=300,
+        )
+        d = _parse_json(content or "", "object")
+        if isinstance(d, dict):
+            details_map = {str(k): str(v) for k, v in d.items()}
+
+    for key, items in bucket.items():
+        label = label_map.get(key, key)
+        count = len(items)
+        percent = round(count / total * 100)
+        details = details_map.get(key, "")
+        categories.append({
+            "key": key,
+            "label": label,
+            "count": count,
+            "percent": percent,
+            "details": details,
+        })
+
+    # 按数量降序
+    categories.sort(key=lambda x: -x["count"])
+
+    logger.info(f"工作分类生成成功（{len(categories)} 类，共 {total} 个 commit）")
+    return {"categories": categories}

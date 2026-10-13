@@ -13,3 +13,4 @@ data/
 *.db
 config.yaml
 .DS_Store
+.git

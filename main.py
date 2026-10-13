@@ -1,4 +1,12 @@
-"""智能日报生成器 — 主编排入口。"""
+"""智能日报生成器 — 主编排入口。
+
+用法:
+  python main.py                    # 完整流程：采集 → 生成 → 推送
+  python main.py --auto             # 一键自动：采集全部数据源，生成并发送
+  python main.py --check            # 健康检查
+  python main.py --dry-run          # 采集+生成，不推送
+  python main.py --github-only      # 只采集 GitHub，跳过飞书
+"""
 
 from __future__ import annotations
 
@@ -15,9 +23,11 @@ from collector import github_events as github_events_collector
 from collector import lark_task as lark_task_collector
 from generator.formatter import generate
 from generator.summarizer import (
+    classify_work,
     compare_with_yesterday,
     extract_action_items,
     extract_highlights,
+    generate_suggestions,
     summarize,
     summarize_commits,
 )
@@ -338,6 +348,9 @@ class PipelineOutcome:
     action_items: list[dict] = field(default_factory=list)
     commit_summaries: dict[str, str] = field(default_factory=dict)
     comparison: dict = field(default_factory=dict)
+    suggestions: list[dict] = field(default_factory=list)
+    work_classification: dict = field(default_factory=dict)
+    issue_number: int = 0
     sender: str = ""
     recipients: list[str] = field(default_factory=list)
     email_sent: bool = False
@@ -415,8 +428,14 @@ def _resolve_recipients(cfg, override=None) -> list[str]:
 
 
 def _build_subject(cfg, report_date) -> str:
-    prefix = cfg.email.get("subject_prefix") or DEFAULT_SUBJECT_PREFIX
-    return f"{prefix} · {report_date.isoformat()}"
+    """构造邮件标题：研一+姓名+日期+智能日报。
+
+    例如：研一刘雨可2026-10-13智能日报
+    """
+    grade = cfg.email.get("subject_grade") or "研一"
+    name = cfg.email.get("subject_name") or cfg.email.get("sender_name") or "刘雨可"
+    date_str = report_date.strftime("%Y-%m-%d")
+    return f"{grade}{name}{date_str}智能日报"
 
 
 def _send_email_with_retry(report, recipients, cfg, subject,
@@ -513,7 +532,7 @@ def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
 
     members = aggregate_members(cfg, commits, tasks)
 
-    # 读昨天数据
+    # ── 读历史 ──
     storage = ReportStorage(cfg.storage["db_path"])
     yesterday_stats = storage.get_yesterday_stats(until.date())
     if yesterday_stats:
@@ -527,17 +546,31 @@ def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
     else:
         logger.info("无昨日完整日报")
 
-    # LLM 分析
+    # ── issue_number：SQLite 里日报总条数 + 1 ──
+    try:
+        issue_number = storage.count_reports() + 1
+    except Exception:  # noqa: BLE001
+        issue_number = 0
+    logger.info(f"日报期数: 第 {issue_number} 期" if issue_number else "未取到期数")
+
+    # ── LLM 分析 ──
     summary = summarize(members, feishu_msgs, until.date()) or ""
     highlights = extract_highlights(members, feishu_msgs, until.date(), top_n=3)
     action_items = extract_action_items(members, feishu_msgs, until.date(), max_items=5)
     commit_summaries = summarize_commits(members, until.date(), max_commits=20)
 
-    # 昨日对比分析
     comparison = compare_with_yesterday(
         members, summary, highlights, yesterday_payload, until.date(),
     ) or {}
 
+    suggestions = generate_suggestions(
+        members, feishu_msgs, commit_summaries, yesterday_payload,
+        until.date(), max_items=3,
+    ) or []
+
+    work_classification = classify_work(members, commit_summaries, until.date()) or {}
+
+    # ── 生成日报 ──
     report = generate(
         members, until.date(), cfg.team_name,
         events=events_records,
@@ -548,9 +581,13 @@ def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
         action_items=action_items,
         commit_summaries=commit_summaries,
         comparison=comparison,
+        suggestions=suggestions,
+        work_classification=work_classification,
+        issue_number=issue_number,
         summary=summary,
         generated_at=started,
     )
+
     payload = {
         "sources": {"github": github_info, "lark": lark_info,
                     "events": events_info, "feishu_messages": feishu_msgs_info},
@@ -559,6 +596,9 @@ def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
         "action_items": action_items,
         "commit_summaries": commit_summaries,
         "comparison": comparison,
+        "suggestions": suggestions,
+        "work_classification": work_classification,
+        "issue_number": issue_number,
         "members": [
             {"name": m.name, "github_username": m.github_username,
              "commits_failed": m.commits_failed, "tasks_failed": m.tasks_failed,
@@ -593,6 +633,9 @@ def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
             highlights=highlights, action_items=action_items,
             commit_summaries=commit_summaries,
             comparison=comparison,
+            suggestions=suggestions,
+            work_classification=work_classification,
+            issue_number=issue_number,
             sender=sender, recipients=recipients,
         )
 
@@ -623,6 +666,9 @@ def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
         highlights=highlights, action_items=action_items,
         commit_summaries=commit_summaries,
         comparison=comparison,
+        suggestions=suggestions,
+        work_classification=work_classification,
+        issue_number=issue_number,
         sender=sender, recipients=recipients,
         email_sent=email_ok, feishu_sent=feishu_ok,
     )
