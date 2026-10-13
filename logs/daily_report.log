@@ -1,0 +1,20 @@
+{"ts": "2026-10-12T21:00:44.230577+08:00", "level": "INFO", "logger": "daily_report.main", "msg": "日报任务开始: 2026-10-12T21:00:44.230577+08:00"}
+{"ts": "2026-10-12T21:00:46.440949+08:00", "level": "INFO", "logger": "daily_report.main", "msg": "GitHub 采集完成: success=True, count=2, branch=master"}
+{"ts": "2026-10-12T21:00:46.440949+08:00", "level": "INFO", "logger": "daily_report.main", "msg": "未配置 lark.tasklist_id，跳过飞书任务采集"}
+{"ts": "2026-10-12T21:00:46.440949+08:00", "level": "INFO", "logger": "daily_report.main", "msg": "飞书任务采集完成: success=True, count=0"}
+{"ts": "2026-10-12T21:00:46.447180+08:00", "level": "INFO", "logger": "daily_report.collector.github_events", "msg": "[events] user='lyk669' url='/users/lyk669/events'"}
+{"ts": "2026-10-12T21:00:47.314149+08:00", "level": "INFO", "logger": "daily_report.main", "msg": "GitHub 活动采集完成: success=True, count=0"}
+{"ts": "2026-10-12T21:00:48.240694+08:00", "level": "INFO", "logger": "daily_report.collector.feishu_message", "msg": "飞书群消息采集完成: 保留 1 条，过滤 1 条"}
+{"ts": "2026-10-12T21:00:48.240694+08:00", "level": "INFO", "logger": "daily_report.main", "msg": "飞书消息采集完成: success=True, count=1"}
+{"ts": "2026-10-12T21:00:48.255330+08:00", "level": "INFO", "logger": "daily_report.main", "msg": "读到昨日统计: {'date': '2026-10-11', 'commits': 3, 'files': 18, 'additions': 1656, 'deletions': 610}"}
+{"ts": "2026-10-12T21:00:48.256331+08:00", "level": "INFO", "logger": "daily_report.main", "msg": "读到昨日完整日报，可做变化分析"}
+{"ts": "2026-10-12T21:00:50.066884+08:00", "level": "INFO", "logger": "daily_report.generator.summarizer", "msg": "今日总结生成成功（196 字）"}
+{"ts": "2026-10-12T21:00:51.135269+08:00", "level": "INFO", "logger": "daily_report.generator.summarizer", "msg": "今日亮点生成成功（3 条）"}
+{"ts": "2026-10-12T21:00:54.017155+08:00", "level": "INFO", "logger": "daily_report.generator.summarizer", "msg": "commit 摘要生成成功（2/2 条）"}
+{"ts": "2026-10-12T21:00:55.460476+08:00", "level": "INFO", "logger": "daily_report.generator.summarizer", "msg": "相比昨天分析生成成功: trend=功能推进"}
+{"ts": "2026-10-12T21:00:55.466209+08:00", "level": "INFO", "logger": "daily_report.main", "msg": "日报已写入 SQLite id=66"}
+{"ts": "2026-10-12T21:00:55.469215+08:00", "level": "INFO", "logger": "daily_report.main", "msg": "准备发送日报邮件 | 主题: 刘雨可—智能日报 · 2026-10-12 | 收件人: ['1730173029@qq.com']"}
+{"ts": "2026-10-12T21:00:57.254247+08:00", "level": "INFO", "logger": "daily_report.main", "msg": "邮件发送成功"}
+{"ts": "2026-10-12T21:00:58.018052+08:00", "level": "INFO", "logger": "daily_report.notifier.feishu", "msg": "飞书日报推送成功: chat_id=oc_90a167bb9750319808b1bf1c3f30d91e"}
+{"ts": "2026-10-12T21:00:58.020084+08:00", "level": "INFO", "logger": "daily_report.main", "msg": "推送结果: email=True feishu=True"}
+{"ts": "2026-10-12T21:00:58.020084+08:00", "level": "INFO", "logger": "daily_report.main", "msg": "日报任务结束: 0:00:13.789507"}
