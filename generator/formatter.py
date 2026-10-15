@@ -1,17 +1,14 @@
-"""日报生成器 — 输出 Markdown + HTML（企业周报风格 v3.0，无 emoji）。
+"""日报生成器 — 输出 Markdown + HTML（企业周报风格 v4.1，无 emoji）。
 
 结构：
   # 标题 + 日期期数
   ## 一句话结论
   ## 今日概览
   ## 今日亮点
-  ## 工作明细（按性质）
+  ## 工作明细（分类概览 + 全天汇总 + 提交明细）
   ## 飞书协作动态
-    ### 任务进展
-    ### 群讨论要点
-    <details>原始消息</details>
-  ## 问题与思考（支持 AI 草稿 / 用户输入 双源）
-  ## 明日计划（同上）
+  ## 问题与思考
+  ## 明日计划
   ## 风险与待办
   底部元信息
 """
@@ -36,9 +33,14 @@ class Report:
     generated_at: datetime
 
 
-_STATUS_CN = {
-    "added": "新增", "modified": "修改",
-    "removed": "删除", "deleted": "删除", "renamed": "重命名",
+# ============ 常量 ============
+
+_STATUS_TEXT = {
+    "added": "新增",
+    "modified": "修改",
+    "removed": "删除",
+    "deleted": "删除",
+    "renamed": "重命名",
 }
 
 _WEEKDAY_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
@@ -51,8 +53,37 @@ _SOURCE_LABEL = {
     "hybrid": "AI + 用户混合",
 }
 
+# 分类规则：从上到下匹配，先命中先用
+# 注意：关键词不要带尾随空格，避免匹配失效
+_CATEGORY_RULES = [
+    ("新功能", ["feat:", "feature:", "add:", "new feature", "新增功能", "新增", "添加"]),
+    ("修复", ["fix:", "bugfix:", "hotfix:", "bug:", "patch:", "修复", "修正"]),
+    ("重构", ["refactor:", "重构", "rewrite", "重写"]),
+    ("优化", ["perf:", "优化", "optimize", "improve"]),
+    ("测试", ["test:", "tests:", "测试", "unittest", "pytest"]),
+    ("文档", ["docs:", "doc:", "文档", "readme", "更新说明", "补充说明"]),
+    ("功能迭代", ["更新", "迭代", "update", "升级", "新增日报"]),
+    ("工程维护", [
+        "chore:", "ci:", "build:", "style:", "配置", "构建",
+        "删除", "清理", "delete", "remove", "clean",
+        "gitignore", "轮转", "rotate", "logs/",
+    ]),
+]
 
-# ---------- 工具函数 ----------
+
+# ============ 工具函数 ============
+
+def _classify_commit_message(msg: str) -> str:
+    """按 commit message 分类。返回类别名，命中不了返回 '_other'。"""
+    if not msg:
+        return "_other"
+    m = msg.strip().lower()
+    for label, keywords in _CATEGORY_RULES:
+        for kw in keywords:
+            if kw in m:
+                return label
+    return "_other"
+
 
 def _to_local(dt: datetime) -> datetime:
     try:
@@ -67,12 +98,6 @@ def _fmt_time(dt) -> str:
     return _to_local(dt).strftime("%H:%M")
 
 
-def _fmt_datetime(dt) -> str:
-    if dt is None:
-        return "---- --:--"
-    return _to_local(dt).strftime("%Y-%m-%d %H:%M")
-
-
 def _fmt_num(n) -> str:
     try:
         return f"{int(n):,}"
@@ -80,12 +105,8 @@ def _fmt_num(n) -> str:
         return str(n)
 
 
-def _short_sha(sha) -> str:
-    return (sha or "-------")[:7]
-
-
-def _status_cn(status: str) -> str:
-    return _STATUS_CN.get((status or "").lower(), "修改")
+def _status_text(status: str) -> str:
+    return _STATUS_TEXT.get((status or "").lower(), "修改")
 
 
 def _commit_link(commit) -> str:
@@ -200,36 +221,228 @@ def _extract_task_changes(tasks) -> list:
     return out
 
 
-def _render_dual_source_markdown(
-    final_items: list,
-    ai_items: list,
-    source: str,
-    empty_hint: str = "_（无内容）_",
-) -> list[str]:
-    """渲染「问题与思考」或「明日计划」的双源 Markdown。
+def _texts_of_items(items) -> list:
+    out = []
+    for it in (items or []):
+        if isinstance(it, dict):
+            t = (it.get("text") or "").strip()
+        else:
+            t = str(it).strip()
+        if t:
+            out.append(t)
+    return out
 
-    规则：
-      - source = "ai"     → 只显示 final（即 AI 草稿），无折叠
-      - source = "manual" → 只显示 final（用户输入），AI 草稿折叠
-      - source = "hybrid" → 显示 final，AI 草稿折叠
-    """
-    lines: list[str] = []
-    src_label = _SOURCE_LABEL.get(source, "AI 草稿")
 
-    # 提取纯文本
-    def _texts(items):
-        out = []
-        for it in (items or []):
-            if isinstance(it, dict):
-                t = (it.get("text") or "").strip()
+# ============ 工作明细 ============
+
+def _build_work_summary(members: list, commit_summaries: dict) -> dict:
+    """构建工作明细的数据结构。"""
+    all_commits = [c for m in members for c in (getattr(m, "commits", []) or [])]
+    if not all_commits:
+        return {
+            "categories": [],
+            "commits": [],
+            "total": {
+                "commits": 0, "files": 0, "added": 0, "modified": 0, "removed": 0,
+                "additions": 0, "deletions": 0,
+            },
+        }
+
+    # 分类统计
+    from collections import defaultdict
+    bucket: dict[str, list] = defaultdict(list)
+    for c in all_commits:
+        msg = (getattr(c, "message", "") or "").strip()
+        label = _classify_commit_message(msg)
+        bucket[label].append(c)
+
+    total = len(all_commits)
+    categories = []
+    for label, items in bucket.items():
+        count = len(items)
+        percent = round(count / total * 100)
+        categories.append({
+            "label": label if label != "_other" else "其他",
+            "count": count,
+            "percent": percent,
+            "commits": items,
+        })
+    categories.sort(key=lambda x: -x["count"])
+
+    # 逐条明细
+    sorted_commits = sorted(
+        all_commits,
+        key=lambda c: getattr(c, "timestamp", None) or datetime.min,
+        reverse=True,
+    )
+
+    commit_details = []
+    total_add = total_del = total_files = 0
+    status_count = {"added": 0, "modified": 0, "removed": 0}
+
+    for idx, c in enumerate(sorted_commits, 1):
+        ts = _fmt_time(getattr(c, "timestamp", None))
+        msg = (getattr(c, "message", "") or "").strip().splitlines()[0]
+        sha = getattr(c, "sha", "") or ""
+        url = _commit_link(c)
+        add = int(getattr(c, "additions", 0) or 0)
+        dele = int(getattr(c, "deletions", 0) or 0)
+        fc = int(getattr(c, "files_changed", 0) or 0)
+        ai_summary = commit_summaries.get(sha, "") if commit_summaries else ""
+
+        files = []
+        for fd in _commit_files(c):
+            fname = getattr(fd, "filename", "") or "?"
+            fadd = int(getattr(fd, "additions", 0) or 0)
+            fdel = int(getattr(fd, "deletions", 0) or 0)
+            raw_status = (getattr(fd, "status", "modified") or "modified").lower()
+            fstatus = _status_text(raw_status)
+            files.append({
+                "filename": fname, "status": fstatus,
+                "additions": fadd, "deletions": fdel,
+            })
+            total_files += 1
+            if raw_status == "added":
+                status_count["added"] += 1
+            elif raw_status in {"removed", "deleted"}:
+                status_count["removed"] += 1
             else:
-                t = str(it).strip()
-            if t:
-                out.append(t)
-        return out
+                status_count["modified"] += 1
 
-    final_texts = _texts(final_items)
-    ai_texts = _texts(ai_items)
+        total_add += add
+        total_del += dele
+
+        commit_details.append({
+            "idx": idx, "time": ts, "msg": msg,
+            "sha": sha, "short_sha": sha[:7] if sha else "-------",
+            "url": url,
+            "additions": add, "deletions": dele, "files_count": fc,
+            "ai_summary": ai_summary,
+            "files": files,
+        })
+
+    return {
+        "categories": categories,
+        "commits": commit_details,
+        "total": {
+            "commits": total,
+            "files": total_files,
+            "added": status_count["added"],
+            "modified": status_count["modified"],
+            "removed": status_count["removed"],
+            "additions": total_add,
+            "deletions": total_del,
+        },
+    }
+
+
+def _render_one_commit_markdown(c: dict) -> list:
+    """渲染单条 commit（Markdown）。返回行列表。"""
+    lines = []
+    lines.append(f"#### {c['idx']}. {c['time']} · {c['msg']}")
+    lines.append("")
+    sha_link = f"[查看提交]({c['url']})" if c['url'] else "（无链接）"
+    lines.append(f"- Commit `{c['short_sha']}` · {sha_link}")
+    lines.append(
+        f"- 变更：**+{_fmt_num(c['additions'])} / -{_fmt_num(c['deletions'])}**"
+        f" · {c['files_count']} 个文件"
+    )
+    if c['ai_summary']:
+        lines.append(f"- 摘要：{c['ai_summary']}")
+    lines.append("")
+
+    if c['files']:
+        lines.append("| 文件 | 状态 | 增 / 删 |")
+        lines.append("|:-----|:----:|:------:|")
+        for f in c['files']:
+            fname = f['filename'].replace("|", "\\|")
+            lines.append(
+                f"| `{fname}` | {f['status']} "
+                f"| +{_fmt_num(f['additions'])} / -{_fmt_num(f['deletions'])} |"
+            )
+        lines.append("")
+    return lines
+
+
+def _render_one_commit_html(c: dict, esc) -> str:
+    """渲染单条 commit（HTML）。"""
+    parts = []
+    parts.append(
+        "<div style='border:1px solid #e0e5f5;border-radius:6px;"
+        "margin:12px 0;overflow:hidden;'>"
+    )
+    parts.append(
+        f"<div style='background:#4a6cf7;color:#fff;padding:8px 14px;"
+        f"font-weight:600;font-size:14px;'>"
+        f"{c['idx']}. {esc(c['time'])} · {esc(c['msg'])}</div>"
+    )
+    parts.append("<div style='padding:12px 14px;'>")
+    sha = esc(c['short_sha'])
+    url = esc(c['url'])
+    if url:
+        link_html = f"<a href='{url}' style='color:#4a6cf7;'>查看提交</a>"
+    else:
+        link_html = "<span style='color:#999;'>（无链接）</span>"
+    parts.append(
+        f"<p style='margin:4px 0;font-size:13px;'>"
+        f"<b>Commit</b> <code>{sha}</code> · {link_html}</p>"
+    )
+    parts.append(
+        f"<p style='margin:4px 0;font-size:13px;'>"
+        f"<b>变更</b> "
+        f"<span style='color:#2e7d32;'>+{_fmt_num(c['additions'])}</span> / "
+        f"<span style='color:#c62828;'>-{_fmt_num(c['deletions'])}</span>"
+        f" · {c['files_count']} 个文件</p>"
+    )
+    if c['ai_summary']:
+        parts.append(
+            f"<p style='margin:4px 0;font-size:13px;'>"
+            f"<b>摘要</b> {esc(c['ai_summary'])}</p>"
+        )
+
+    if c['files']:
+        parts.append(
+            "<table style='border-collapse:collapse;width:100%;"
+            "font-size:12px;margin:8px 0 0 0;'>"
+            "<tr style='color:#666;'>"
+            "<th style='text-align:left;padding:4px 8px;"
+            "border:1px solid #e0e5f5;background:#f5f7ff;'>文件</th>"
+            "<th style='text-align:center;padding:4px 8px;"
+            "border:1px solid #e0e5f5;background:#f5f7ff;width:60px;'>状态</th>"
+            "<th style='text-align:center;padding:4px 8px;"
+            "border:1px solid #e0e5f5;background:#f5f7ff;width:110px;'>增 / 删</th>"
+            "</tr>"
+        )
+        for f in c['files']:
+            fname = esc(f['filename'])
+            fstatus = esc(f['status'])
+            parts.append(
+                f"<tr>"
+                f"<td style='padding:3px 8px;border:1px solid #e0e5f5;'>"
+                f"<code>{fname}</code></td>"
+                f"<td style='padding:3px 8px;border:1px solid #e0e5f5;"
+                f"text-align:center;'>{fstatus}</td>"
+                f"<td style='padding:3px 8px;border:1px solid #e0e5f5;"
+                f"text-align:center;'>"
+                f"<span style='color:#2e7d32;'>+{_fmt_num(f['additions'])}</span> / "
+                f"<span style='color:#c62828;'>-{_fmt_num(f['deletions'])}</span>"
+                f"</td>"
+                f"</tr>"
+            )
+        parts.append("</table>")
+
+    parts.append("</div>")
+    parts.append("</div>")
+    return "".join(parts)
+
+
+# ============ 双源渲染（问题与思考 / 明日计划） ============
+
+def _render_dual_source_markdown(final_items, ai_items, source: str) -> list:
+    lines = []
+    src_label = _SOURCE_LABEL.get(source, "AI 草稿")
+    final_texts = _texts_of_items(final_items)
+    ai_texts = _texts_of_items(ai_items)
 
     lines.append(f"> 来源：{src_label}")
     lines.append("")
@@ -239,13 +452,12 @@ def _render_dual_source_markdown(
             lines.append(f"{i}. {t}")
         lines.append("")
     else:
-        lines.append(empty_hint)
+        lines.append("_（无内容）_")
         lines.append("")
 
-    # 需要折叠 AI 草稿的情况
     if source in {"manual", "hybrid"} and ai_texts:
         lines.append("<details>")
-        lines.append(f"<summary>AI 草稿（点开对比）</summary>")
+        lines.append("<summary>AI 草稿（点开对比）</summary>")
         lines.append("")
         for i, t in enumerate(ai_texts, 1):
             lines.append(f"{i}. {t}")
@@ -256,32 +468,15 @@ def _render_dual_source_markdown(
     return lines
 
 
-def _render_dual_source_html(
-    final_items: list,
-    ai_items: list,
-    source: str,
-    empty_hint: str = "<p style='color:#999;'>（无内容）</p>",
-) -> str:
-    """渲染双源 HTML。"""
+def _render_dual_source_html(final_items, ai_items, source: str) -> str:
     src_label = _SOURCE_LABEL.get(source, "AI 草稿")
-    parts: list[str] = []
-
-    def _texts(items):
-        out = []
-        for it in (items or []):
-            if isinstance(it, dict):
-                t = (it.get("text") or "").strip()
-            else:
-                t = str(it).strip()
-            if t:
-                out.append(t)
-        return out
-
-    final_texts = _texts(final_items)
-    ai_texts = _texts(ai_items)
+    parts = []
+    final_texts = _texts_of_items(final_items)
+    ai_texts = _texts_of_items(ai_items)
 
     parts.append(
-        f"<p style='color:#888;font-size:13px;margin:6px 0;'>来源：{_html.escape(src_label)}</p>"
+        f"<p style='color:#888;font-size:13px;margin:6px 0;'>"
+        f"来源：{_html.escape(src_label)}</p>"
     )
 
     if final_texts:
@@ -290,7 +485,7 @@ def _render_dual_source_html(
             parts.append(f"<li style='margin:6px 0;color:#333;'>{_html.escape(t)}</li>")
         parts.append("</ol>")
     else:
-        parts.append(empty_hint)
+        parts.append("<p style='color:#999;'>（无内容）</p>")
 
     if source in {"manual", "hybrid"} and ai_texts:
         parts.append("<details style='margin-top:12px;'>")
@@ -306,13 +501,12 @@ def _render_dual_source_html(
     return "".join(parts)
 
 
-# ---------- Markdown ----------
+# ============ Markdown 渲染 ============
 
 def _render_markdown(
     members: list,
     report_date: date,
     team_name: str,
-    events: list | None,
     feishu_messages: list | None,
     summary: str | None,
     generated_at: datetime,
@@ -321,8 +515,6 @@ def _render_markdown(
     highlights: list[str] | None = None,
     action_items: list[dict] | None = None,
     commit_summaries: dict[str, str] | None = None,
-    comparison: dict | None = None,
-    work_classification: dict | None = None,
     issue_number: int = 0,
     risks: list[dict] | None = None,
     problems: list[dict] | None = None,
@@ -331,9 +523,7 @@ def _render_markdown(
     ai_next_plan: list[dict] | None = None,
     reflection_source: str = "ai",
     tasks=None,
-    **_ignored,
 ) -> str:
-    events = events or []
     feishu_messages = feishu_messages or []
     feishu_stats = feishu_stats or {}
     yesterday_stats = yesterday_stats or {}
@@ -347,8 +537,6 @@ def _render_markdown(
     ai_next_plan = ai_next_plan or []
     summary = (summary or "").strip()
 
-    all_commits = [c for m in members for c in (getattr(m, "commits", []) or [])]
-    total_commits = len(all_commits)
     weekday_cn = _WEEKDAY_CN[report_date.weekday()]
 
     kept = int(feishu_stats.get("kept", len(feishu_messages)) or 0)
@@ -362,14 +550,14 @@ def _render_markdown(
     task_changes = _extract_task_changes(tasks)
     risks_grouped = _group_risks_by_category(risks)
 
-    lines: list[str] = []
+    lines: list = []
 
     # ============ 标题 ============
     lines.append(f"# {team_name}")
     issue_str = f"· 第 {issue_number} 期" if issue_number else ""
     lines.append(f"## {report_date.isoformat()}（{weekday_cn}）{issue_str}")
     lines.append("")
-    lines.append(f"> 项目：智能日报生成器　负责人：刘雨可  ")
+    lines.append("> 项目：智能日报生成器　负责人：刘雨可  ")
     lines.append(f"> 采集窗口：{report_date.isoformat()} 00:00 ~ {_fmt_time(generated_at)}（北京时间）")
     lines.append("")
 
@@ -389,21 +577,25 @@ def _render_markdown(
     lines.append("| 指标 | 今日 | 昨日 | 环比 |")
     lines.append("|:-----|:----:|:----:|:----:|")
 
-    def row(label, key):
+    def _row(label, key):
         cur_v = today.get(key, 0)
         y_v = yest.get(key) if yest else None
         cur_s = _fmt_num(cur_v)
         y_s = _fmt_num(y_v) if y_v is not None else "—"
         return f"| {label} | {cur_s} | {y_s} | {_delta_str(cur_v, y_v)} |"
 
-    lines.append(row("代码提交", "commits"))
-    lines.append(row("涉及文件", "files"))
-    lines.append(f"| 代码变更 | +{_fmt_num(today['additions'])} / -{_fmt_num(today['deletions'])} | "
-                 + (f"+{_fmt_num(yest['additions'])} / -{_fmt_num(yest['deletions'])}"
-                    if yest else "—")
-                 + f" | {_delta_str(today['net'], yest['net'] if yest else None)} |")
-    lines.append(row("飞书任务", "tasks"))
-    lines.append(row("群消息", "msgs"))
+    lines.append(_row("代码提交", "commits"))
+    lines.append(_row("涉及文件", "files"))
+    y_change_s = (
+        f"+{_fmt_num(yest['additions'])} / -{_fmt_num(yest['deletions'])}"
+        if yest else "—"
+    )
+    lines.append(
+        f"| 代码变更 | +{_fmt_num(today['additions'])} / -{_fmt_num(today['deletions'])} "
+        f"| {y_change_s} | {_delta_str(today['net'], yest['net'] if yest else None)} |"
+    )
+    lines.append(_row("飞书任务", "tasks"))
+    lines.append(_row("群消息", "msgs"))
     lines.append("")
 
     # ============ 今日亮点 ============
@@ -415,24 +607,63 @@ def _render_markdown(
         lines.append("")
 
     # ============ 工作明细 ============
-    lines.append("## 工作明细（按性质）")
+    lines.append("## 工作明细")
     lines.append("")
-    categories = (work_classification or {}).get("categories") or []
-    if categories:
+
+    work = _build_work_summary(members, commit_summaries)
+    if not work["commits"]:
+        lines.append("_本日无代码提交记录。_")
+        lines.append("")
+    else:
+        # 分类概览
+        lines.append("### 分类概览")
+        lines.append("")
         lines.append("| 类型 | 占比 | 做了什么 |")
         lines.append("|:-----|:----:|:---------|")
-        for cat in categories:
-            if cat.get("count", 0) == 0:
+        for cat in work["categories"]:
+            if cat["count"] == 0:
                 continue
-            label = cat.get("label", "")
-            percent = f"{cat.get('percent', 0)}%"
-            details = cat.get("details", "") or ""
+            label = cat["label"]
+            percent = f"{cat['percent']}%"
+            msgs = [
+                (getattr(c, "message", "") or "").split("\n")[0].strip()
+                for c in cat["commits"]
+            ]
+            details = "、".join(msgs[:2])
+            if len(msgs) > 2:
+                details += f" 等 {len(msgs)} 项"
             details = details.replace("|", "\\|")
             lines.append(f"| {label} | {percent} | {details} |")
         lines.append("")
-    else:
-        lines.append("_本日无代码提交记录。_")
+
+        # 全天汇总
+        t = work["total"]
+        lines.append(
+            f"**全天汇总**：{t['commits']} 次提交 · {t['files']} 个文件"
+            f"（新增 {t['added']} · 修改 {t['modified']} · 删除 {t['removed']}）"
+            f" · +{_fmt_num(t['additions'])} / -{_fmt_num(t['deletions'])}"
+        )
         lines.append("")
+
+        # 提交明细
+        lines.append("### 提交明细")
+        lines.append("")
+
+        commits_list = work["commits"]
+        inline_limit = 3 if len(commits_list) > 5 else len(commits_list)
+
+        for c in commits_list[:inline_limit]:
+            lines.extend(_render_one_commit_markdown(c))
+
+        if len(commits_list) > inline_limit:
+            rest = len(commits_list) - inline_limit
+            lines.append("<details>")
+            lines.append(f"<summary>展开后 {rest} 条提交（点击展开）</summary>")
+            lines.append("")
+            for c in commits_list[inline_limit:]:
+                lines.extend(_render_one_commit_markdown(c))
+            lines.append("</details>")
+            lines.append("")
 
     # ============ 飞书协作动态 ============
     has_any_feishu = bool(task_changes) or bool(feishu_messages) or bool(action_items)
@@ -481,31 +712,23 @@ def _render_markdown(
             lines.append("")
 
             if total_msgs or skipped:
-                lines.append(f"> 本日共收到 {total_msgs} 条消息，保留 {kept} 条，"
-                             f"过滤 {skipped} 条（撤回 / @某人 / 太短 / 系统消息）。")
+                lines.append(
+                    f"> 本日共收到 {total_msgs} 条消息，保留 {kept} 条，"
+                    f"过滤 {skipped} 条（撤回 / @某人 / 太短 / 系统消息）。"
+                )
                 lines.append("")
 
     # ============ 问题与思考 ============
     if problems or ai_problems:
         lines.append("## 问题与思考")
         lines.append("")
-        lines.extend(_render_dual_source_markdown(
-            final_items=problems,
-            ai_items=ai_problems,
-            source=reflection_source,
-            empty_hint="_（无内容）_",
-        ))
+        lines.extend(_render_dual_source_markdown(problems, ai_problems, reflection_source))
 
     # ============ 明日计划 ============
     if next_plan or ai_next_plan:
         lines.append("## 明日计划")
         lines.append("")
-        lines.extend(_render_dual_source_markdown(
-            final_items=next_plan,
-            ai_items=ai_next_plan,
-            source=reflection_source,
-            empty_hint="_（无内容）_",
-        ))
+        lines.extend(_render_dual_source_markdown(next_plan, ai_next_plan, reflection_source))
 
     # ============ 风险与待办 ============
     if risks_grouped:
@@ -521,19 +744,18 @@ def _render_markdown(
     # ============ 底部 ============
     lines.append("---")
     lines.append("")
-    lines.append(f"**数据来源**　GitHub · 飞书开放平台  ")
-    lines.append(f"**文档版本**　v3.0 · 由智能日报生成器自动生成")
+    lines.append("**数据来源**　GitHub · 飞书开放平台  ")
+    lines.append("**文档版本**　v4.1 · 由智能日报生成器自动生成")
 
     return "\n".join(lines)
 
 
-# ---------- HTML ----------
+# ============ HTML 渲染 ============
 
 def _render_html(
     members: list,
     report_date: date,
     team_name: str,
-    events: list | None,
     feishu_messages: list | None,
     summary: str | None,
     generated_at: datetime,
@@ -542,8 +764,6 @@ def _render_html(
     highlights: list[str] | None = None,
     action_items: list[dict] | None = None,
     commit_summaries: dict[str, str] | None = None,
-    comparison: dict | None = None,
-    work_classification: dict | None = None,
     issue_number: int = 0,
     risks: list[dict] | None = None,
     problems: list[dict] | None = None,
@@ -552,9 +772,7 @@ def _render_html(
     ai_next_plan: list[dict] | None = None,
     reflection_source: str = "ai",
     tasks=None,
-    **_ignored,
 ) -> str:
-    events = events or []
     feishu_messages = feishu_messages or []
     feishu_stats = feishu_stats or {}
     yesterday_stats = yesterday_stats or {}
@@ -571,8 +789,6 @@ def _render_html(
     def esc(s) -> str:
         return _html.escape(str(s or ""))
 
-    all_commits = [c for m in members for c in (getattr(m, "commits", []) or [])]
-    total_commits = len(all_commits)
     weekday_cn = _WEEKDAY_CN[report_date.weekday()]
 
     kept = int(feishu_stats.get("kept", len(feishu_messages)) or 0)
@@ -588,7 +804,7 @@ def _render_html(
 
     h2_style = ("color:#1a237e;border-bottom:2px solid #4a6cf7;padding-bottom:6px;"
                 "margin-top:32px;margin-bottom:16px;font-size:20px;")
-    h3_style = ("color:#283593;margin-top:22px;margin-bottom:10px;font-size:16px;")
+    h3_style = "color:#283593;margin-top:22px;margin-bottom:10px;font-size:16px;"
     table_style = "border-collapse:collapse;width:100%;font-size:13px;margin:8px 0;"
     th_style = ("background:#f0f3ff;color:#1a237e;padding:6px 10px;"
                 "text-align:left;border:1px solid #d0d7f0;font-weight:600;")
@@ -630,7 +846,7 @@ def _render_html(
         color = "#2e7d32" if diff > 0 else "#c62828"
         return f"<span style='color:{color};'>{'↑' if diff>0 else '↓'} {abs(pct):.1f}%</span>"
 
-    p: list[str] = []
+    p: list = []
     p.append("<html><body style=\"font-family:-apple-system,'Segoe UI','PingFang SC',"
              "Arial,sans-serif;line-height:1.7;color:#222;max-width:920px;margin:0 auto;"
              "padding:20px;background:#fafafa;\">")
@@ -691,21 +907,53 @@ def _render_html(
         p.append("</ol>")
 
     # 工作明细
-    p.append("<h2 style='" + h2_style + "'>工作明细（按性质）</h2>")
-    categories = (work_classification or {}).get("categories") or []
-    if categories:
-        crows = []
-        for cat in categories:
-            if cat.get("count", 0) == 0:
-                continue
-            crows.append([
-                esc(cat.get("label", "")),
-                f"{cat.get('percent', 0)}%",
-                esc(cat.get("details", "")),
-            ])
-        p.append(table(["类型", "占比", "做了什么"], crows, ["left", "center", "left"]))
-    else:
+    p.append("<h2 style='" + h2_style + "'>工作明细</h2>")
+    work = _build_work_summary(members, commit_summaries)
+    if not work["commits"]:
         p.append("<p style='color:#999;'>本日无代码提交记录。</p>")
+    else:
+        p.append("<h3 style='" + h3_style + "'>分类概览</h3>")
+        crows = []
+        for cat in work["categories"]:
+            if cat["count"] == 0:
+                continue
+            msgs = [
+                (getattr(c, "message", "") or "").split("\n")[0].strip()
+                for c in cat["commits"]
+            ]
+            details = "、".join(msgs[:2])
+            if len(msgs) > 2:
+                details += f" 等 {len(msgs)} 项"
+            crows.append([esc(cat["label"]), f"{cat['percent']}%", esc(details)])
+        p.append(table(["类型", "占比", "做了什么"], crows,
+                       ["left", "center", "left"]))
+
+        t = work["total"]
+        p.append(
+            f"<p style='background:#f0f3ff;border-radius:4px;padding:8px 12px;"
+            f"margin:8px 0;font-size:13px;'>"
+            f"<b>全天汇总</b>：{t['commits']} 次提交 · {t['files']} 个文件"
+            f"（新增 {t['added']} · 修改 {t['modified']} · 删除 {t['removed']}）"
+            f" · <span style='color:#2e7d32;'>+{_fmt_num(t['additions'])}</span> / "
+            f"<span style='color:#c62828;'>-{_fmt_num(t['deletions'])}</span>"
+            f"</p>"
+        )
+
+        p.append("<h3 style='" + h3_style + "'>提交明细</h3>")
+        commits_list = work["commits"]
+        inline_limit = 3 if len(commits_list) > 5 else len(commits_list)
+        for c in commits_list[:inline_limit]:
+            p.append(_render_one_commit_html(c, esc))
+        if len(commits_list) > inline_limit:
+            rest = len(commits_list) - inline_limit
+            p.append("<details style='margin-top:12px;'>")
+            p.append(
+                f"<summary style='cursor:pointer;color:#4a6cf7;'>"
+                f"展开后 {rest} 条提交（点击展开）</summary>"
+            )
+            for c in commits_list[inline_limit:]:
+                p.append(_render_one_commit_html(c, esc))
+            p.append("</details>")
 
     # 飞书协作动态
     has_any_feishu = bool(task_changes) or bool(feishu_messages) or bool(action_items)
@@ -761,12 +1009,7 @@ def _render_html(
         p.append("<h2 style='" + h2_style + "'>问题与思考</h2>")
         p.append("<div style='background:#f5f0ff;border-left:4px solid #8b5cf6;"
                  "border-radius:6px;padding:12px 16px;margin:10px 0;'>")
-        p.append(_render_dual_source_html(
-            final_items=problems,
-            ai_items=ai_problems,
-            source=reflection_source,
-            empty_hint="<p style='color:#999;'>（无内容）</p>",
-        ))
+        p.append(_render_dual_source_html(problems, ai_problems, reflection_source))
         p.append("</div>")
 
     # 明日计划
@@ -774,12 +1017,7 @@ def _render_html(
         p.append("<h2 style='" + h2_style + "'>明日计划</h2>")
         p.append("<div style='background:#e8f5e9;border-left:4px solid #2e7d32;"
                  "border-radius:6px;padding:12px 16px;margin:10px 0;'>")
-        p.append(_render_dual_source_html(
-            final_items=next_plan,
-            ai_items=ai_next_plan,
-            source=reflection_source,
-            empty_hint="<p style='color:#999;'>（无内容）</p>",
-        ))
+        p.append(_render_dual_source_html(next_plan, ai_next_plan, reflection_source))
         p.append("</div>")
 
     # 风险与待办
@@ -793,22 +1031,21 @@ def _render_html(
     # 底部
     p.append("<hr style='border:none;border-top:2px solid #e0e5f5;margin:32px 0 20px 0;'>")
     p.append("<div style='color:#999;font-size:12px;line-height:1.9;'>")
-    p.append(f"<b>数据来源</b>　GitHub · 飞书开放平台<br>")
-    p.append(f"<b>文档版本</b>　v3.0 · 由智能日报生成器自动生成")
+    p.append("<b>数据来源</b>　GitHub · 飞书开放平台<br>")
+    p.append("<b>文档版本</b>　v4.1 · 由智能日报生成器自动生成")
     p.append("</div>")
 
     p.append("</body></html>")
     return "".join(p)
 
 
-# ---------- 对外入口 ----------
+# ============ 对外入口 ============
 
 def generate(
     members: list,
     report_date: date,
     team_name: str,
     *,
-    events: list | None = None,
     feishu_messages: list | None = None,
     summary: str | None = None,
     generated_at: datetime | None = None,
@@ -817,9 +1054,6 @@ def generate(
     highlights: list[str] | None = None,
     action_items: list[dict] | None = None,
     commit_summaries: dict[str, str] | None = None,
-    comparison: dict | None = None,
-    suggestions: list[dict] | None = None,      # 兼容保留，内部不使用
-    work_classification: dict | None = None,
     issue_number: int = 0,
     risks: list[dict] | None = None,
     problems: list[dict] | None = None,
@@ -829,20 +1063,26 @@ def generate(
     reflection_source: str = "ai",
     tasks=None,
 ) -> Report:
+    """生成日报对象（Markdown + HTML）。
+
+    已移除的参数（v3 遗留）：
+      - comparison：从未使用
+      - suggestions：从未使用
+      - events：从未使用
+      - work_classification：已由 formatter 内部重新分类
+    """
     generated_at = generated_at or datetime.now()
     md = _render_markdown(
-        members, report_date, team_name, events, feishu_messages,
+        members, report_date, team_name, feishu_messages,
         summary, generated_at, feishu_stats, yesterday_stats, highlights,
-        action_items, commit_summaries, comparison,
-        work_classification, issue_number,
+        action_items, commit_summaries, issue_number,
         risks, problems, next_plan, ai_problems, ai_next_plan,
         reflection_source, tasks,
     )
     html = _render_html(
-        members, report_date, team_name, events, feishu_messages,
+        members, report_date, team_name, feishu_messages,
         summary, generated_at, feishu_stats, yesterday_stats, highlights,
-        action_items, commit_summaries, comparison,
-        work_classification, issue_number,
+        action_items, commit_summaries, issue_number,
         risks, problems, next_plan, ai_problems, ai_next_plan,
         reflection_source, tasks,
     )

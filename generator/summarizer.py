@@ -6,10 +6,9 @@
   3. extract_action_items    群讨论要点（决策 / 待办 / 问题）
   4. summarize_commits       commit diff 摘要
   5. compare_with_yesterday  相比昨天变化分析
-  6. classify_work           commit 分类统计
-  7. generate_risks          风险与待办
-  8. generate_problems       问题与思考（新增，参考历史风格）
-  9. generate_next_plan      明日计划（新增，参考历史风格）
+  6. generate_risks          风险与待办
+  7. generate_problems       问题与思考（参考历史风格）
+  8. generate_next_plan      明日计划（参考历史风格）
 """
 
 from __future__ import annotations
@@ -469,7 +468,7 @@ def compare_with_yesterday(
     return result
 
 
-# ============ 6. commit 分类统计 ============
+# ============ 6. commit 分类（仅用于 generate_risks 内部的规范检测） ============
 
 _CATEGORY_DEFS = [
     ("feat", "新功能"),
@@ -488,6 +487,9 @@ _CATEGORY_DEFS = [
 
 
 def _classify_commit_message(msg: str) -> str | None:
+    """仅用于 generate_risks 里的『commit message 规范』检测。
+    返回类别 key，命中不了返回 None。
+    """
     if not msg:
         return None
     m = msg.strip().lower()
@@ -500,69 +502,6 @@ def _classify_commit_message(msg: str) -> str | None:
     if any(k in m for k in ["update", "更新"]):
         return "_other"
     return None
-
-
-def classify_work(members, commit_summaries: dict, report_date) -> dict:
-    """按 commit type 分类。"""
-    all_commits = [c for m in members for c in (getattr(m, "commits", None) or [])]
-    if not all_commits:
-        return {"categories": []}
-
-    from collections import defaultdict
-    bucket: dict[str, list] = defaultdict(list)
-    for c in all_commits:
-        msg = (getattr(c, "message", "") or "").strip()
-        key = _classify_commit_message(msg)
-        if key is None:
-            key = "_other"
-        bucket[key].append(c)
-
-    total = len(all_commits)
-    label_map = dict(_CATEGORY_DEFS)
-    label_map["_other"] = "其他"
-    label_map["cleanup"] = "清理"
-
-    summary_lines = []
-    for key, items in bucket.items():
-        msgs = [(getattr(c, "message", "") or "").strip().splitlines()[0] for c in items]
-        summary_lines.append(f"{key}: {msgs}")
-
-    details_map = {}
-    if len(bucket) >= 1 and total >= 1:
-        prompt = (
-            "以下是今天 commit 按类型的分组，请为每组生成一句简短的中文详情"
-            "（不超过 25 字，说清楚做了什么）。\n\n"
-            + "\n".join(summary_lines)
-            + "\n\n要求："
-            "① 严格输出 JSON 对象，key 是类别名，value 是详情字符串；"
-            "② 详情要具体（说功能名 / 模块名），不要空话；"
-            '③ 例如：{"refactor": "日报结构整体重写为五段式周报"}'
-            "；④ 不要 emoji，只输出 JSON。"
-        )
-        content = _call_llm(
-            prompt,
-            system="你是一个代码分析助手，擅长用关键词概括一组改动。",
-            max_tokens=300,
-        )
-        d = _parse_json(content or "", "object")
-        if isinstance(d, dict):
-            details_map = {str(k): str(v) for k, v in d.items()}
-
-    categories = []
-    for key, items in bucket.items():
-        count = len(items)
-        percent = round(count / total * 100)
-        categories.append({
-            "key": key,
-            "label": label_map.get(key, key),
-            "count": count,
-            "percent": percent,
-            "details": details_map.get(key, ""),
-        })
-    categories.sort(key=lambda x: -x["count"])
-
-    logger.info(f"工作分类生成成功（{len(categories)} 类，共 {total} 个 commit）")
-    return {"categories": categories}
 
 
 # ============ 7. 风险与待办 ============
@@ -599,7 +538,6 @@ def generate_risks(
     members,
     feishu_messages,
     commit_summaries: dict,
-    work_classification: dict,
     yesterday_payload: dict | None,
     report_date,
 ) -> list[dict]:
@@ -706,7 +644,7 @@ def generate_risks(
     return unique[:5]
 
 
-# ============ 8. 问题与思考（新增） ============
+# ============ 8. 问题与思考 ============
 
 def generate_problems(
     members,
@@ -719,11 +657,7 @@ def generate_problems(
     recent_reflections: list[dict] | None = None,
     max_items: int = 5,
 ) -> list[dict]:
-    """生成「问题与思考」。
-
-    返回 [{"text": "...", "tag": "推测"}]。
-    参考近 7 天用户真实反思的风格。
-    """
+    """生成「问题与思考」。返回 [{"text": "...", "tag": "推测"}]。"""
     api_key = os.environ.get(_API_KEY_ENV, "").strip()
     if not api_key:
         return []
@@ -771,7 +705,6 @@ def generate_problems(
             lines.append(f"【昨日结论】{y_summary}")
             lines.append("")
 
-    # 历史风格参考
     history = _format_history_reflections(recent_reflections or [], max_days=7)
     if history:
         lines.append("【近 7 天用户真实反思（风格参考，不是今天的内容）】")
@@ -819,7 +752,7 @@ def generate_problems(
     return result[:max_items]
 
 
-# ============ 9. 明日计划（升级：参考历史风格） ============
+# ============ 9. 明日计划 ============
 
 def generate_next_plan(
     members,
@@ -832,11 +765,7 @@ def generate_next_plan(
     recent_reflections: list[dict] | None = None,
     max_items: int = 4,
 ) -> list[dict]:
-    """生成明日计划。
-
-    返回 [{"text": "...", "tag": "推测"}]。
-    参考近 7 天用户真实计划。
-    """
+    """生成明日计划。返回 [{"text": "...", "tag": "推测"}]。"""
     api_key = os.environ.get(_API_KEY_ENV, "").strip()
     if not api_key:
         return []
@@ -873,7 +802,6 @@ def generate_next_plan(
             lines.append(f"【昨日结论】{y_summary}")
             lines.append("")
 
-    # 历史风格参考
     history = _format_history_reflections(recent_reflections or [], max_days=7)
     if history:
         lines.append("【近 7 天用户真实计划（风格参考）】")
