@@ -1,4 +1,4 @@
-"""日报生成器 — 输出 Markdown + HTML（企业周报风格 v4.1，无 emoji）。
+"""日报生成器 — 输出 Markdown + HTML（企业周报风格 v4.2，无 emoji）。
 
 结构：
   # 标题 + 日期期数
@@ -19,6 +19,7 @@ import html as _html
 from dataclasses import dataclass
 from datetime import date, datetime
 
+from generator.classify import classify_commit_message, label_of
 from shared.logger import get_logger
 
 logger = get_logger("daily_report.generator.formatter")
@@ -53,37 +54,8 @@ _SOURCE_LABEL = {
     "hybrid": "AI + 用户混合",
 }
 
-# 分类规则：从上到下匹配，先命中先用
-# 注意：关键词不要带尾随空格，避免匹配失效
-_CATEGORY_RULES = [
-    ("新功能", ["feat:", "feature:", "add:", "new feature", "新增功能", "新增", "添加"]),
-    ("修复", ["fix:", "bugfix:", "hotfix:", "bug:", "patch:", "修复", "修正"]),
-    ("重构", ["refactor:", "重构", "rewrite", "重写"]),
-    ("优化", ["perf:", "优化", "optimize", "improve"]),
-    ("测试", ["test:", "tests:", "测试", "unittest", "pytest"]),
-    ("文档", ["docs:", "doc:", "文档", "readme", "更新说明", "补充说明"]),
-    ("功能迭代", ["更新", "迭代", "update", "升级", "新增日报"]),
-    ("工程维护", [
-        "chore:", "ci:", "build:", "style:", "配置", "构建",
-        "删除", "清理", "delete", "remove", "clean",
-        "gitignore", "轮转", "rotate", "logs/",
-    ]),
-]
-
 
 # ============ 工具函数 ============
-
-def _classify_commit_message(msg: str) -> str:
-    """按 commit message 分类。返回类别名，命中不了返回 '_other'。"""
-    if not msg:
-        return "_other"
-    m = msg.strip().lower()
-    for label, keywords in _CATEGORY_RULES:
-        for kw in keywords:
-            if kw in m:
-                return label
-    return "_other"
-
 
 def _to_local(dt: datetime) -> datetime:
     try:
@@ -248,21 +220,21 @@ def _build_work_summary(members: list, commit_summaries: dict) -> dict:
             },
         }
 
-    # 分类统计
+    # 分类统计（用统一分类器）
     from collections import defaultdict
     bucket: dict[str, list] = defaultdict(list)
     for c in all_commits:
         msg = (getattr(c, "message", "") or "").strip()
-        label = _classify_commit_message(msg)
-        bucket[label].append(c)
+        key = classify_commit_message(msg)
+        bucket[key].append(c)
 
     total = len(all_commits)
     categories = []
-    for label, items in bucket.items():
+    for key, items in bucket.items():
         count = len(items)
         percent = round(count / total * 100)
         categories.append({
-            "label": label if label != "_other" else "其他",
+            "label": label_of(key),          # None → "其他"
             "count": count,
             "percent": percent,
             "commits": items,
@@ -552,7 +524,7 @@ def _render_markdown(
 
     lines: list = []
 
-    # ============ 标题 ============
+    # 标题
     lines.append(f"# {team_name}")
     issue_str = f"· 第 {issue_number} 期" if issue_number else ""
     lines.append(f"## {report_date.isoformat()}（{weekday_cn}）{issue_str}")
@@ -561,7 +533,7 @@ def _render_markdown(
     lines.append(f"> 采集窗口：{report_date.isoformat()} 00:00 ~ {_fmt_time(generated_at)}（北京时间）")
     lines.append("")
 
-    # ============ 一句话结论 ============
+    # 一句话结论
     if summary:
         lines.append("## 一句话结论")
         lines.append("")
@@ -571,7 +543,7 @@ def _render_markdown(
                 lines.append(para)
         lines.append("")
 
-    # ============ 今日概览 ============
+    # 今日概览
     lines.append("## 今日概览")
     lines.append("")
     lines.append("| 指标 | 今日 | 昨日 | 环比 |")
@@ -598,7 +570,7 @@ def _render_markdown(
     lines.append(_row("群消息", "msgs"))
     lines.append("")
 
-    # ============ 今日亮点 ============
+    # 今日亮点
     if highlights:
         lines.append("## 今日亮点")
         lines.append("")
@@ -606,7 +578,7 @@ def _render_markdown(
             lines.append(f"{i}. {h}")
         lines.append("")
 
-    # ============ 工作明细 ============
+    # 工作明细
     lines.append("## 工作明细")
     lines.append("")
 
@@ -615,7 +587,6 @@ def _render_markdown(
         lines.append("_本日无代码提交记录。_")
         lines.append("")
     else:
-        # 分类概览
         lines.append("### 分类概览")
         lines.append("")
         lines.append("| 类型 | 占比 | 做了什么 |")
@@ -636,7 +607,6 @@ def _render_markdown(
             lines.append(f"| {label} | {percent} | {details} |")
         lines.append("")
 
-        # 全天汇总
         t = work["total"]
         lines.append(
             f"**全天汇总**：{t['commits']} 次提交 · {t['files']} 个文件"
@@ -645,7 +615,6 @@ def _render_markdown(
         )
         lines.append("")
 
-        # 提交明细
         lines.append("### 提交明细")
         lines.append("")
 
@@ -665,7 +634,7 @@ def _render_markdown(
             lines.append("</details>")
             lines.append("")
 
-    # ============ 飞书协作动态 ============
+    # 飞书协作动态
     has_any_feishu = bool(task_changes) or bool(feishu_messages) or bool(action_items)
     if has_any_feishu:
         lines.append("## 飞书协作动态")
@@ -718,19 +687,19 @@ def _render_markdown(
                 )
                 lines.append("")
 
-    # ============ 问题与思考 ============
+    # 问题与思考
     if problems or ai_problems:
         lines.append("## 问题与思考")
         lines.append("")
         lines.extend(_render_dual_source_markdown(problems, ai_problems, reflection_source))
 
-    # ============ 明日计划 ============
+    # 明日计划
     if next_plan or ai_next_plan:
         lines.append("## 明日计划")
         lines.append("")
         lines.extend(_render_dual_source_markdown(next_plan, ai_next_plan, reflection_source))
 
-    # ============ 风险与待办 ============
+    # 风险与待办
     if risks_grouped:
         lines.append("## 风险与待办")
         lines.append("")
@@ -741,11 +710,11 @@ def _render_markdown(
                 lines.append(text)
                 lines.append("")
 
-    # ============ 底部 ============
+    # 底部
     lines.append("---")
     lines.append("")
     lines.append("**数据来源**　GitHub · 飞书开放平台  ")
-    lines.append("**文档版本**　v4.1 · 由智能日报生成器自动生成")
+    lines.append("**文档版本**　v4.2 · 由智能日报生成器自动生成")
 
     return "\n".join(lines)
 
@@ -1032,7 +1001,7 @@ def _render_html(
     p.append("<hr style='border:none;border-top:2px solid #e0e5f5;margin:32px 0 20px 0;'>")
     p.append("<div style='color:#999;font-size:12px;line-height:1.9;'>")
     p.append("<b>数据来源</b>　GitHub · 飞书开放平台<br>")
-    p.append("<b>文档版本</b>　v4.1 · 由智能日报生成器自动生成")
+    p.append("<b>文档版本</b>　v4.2 · 由智能日报生成器自动生成")
     p.append("</div>")
 
     p.append("</body></html>")
@@ -1063,14 +1032,6 @@ def generate(
     reflection_source: str = "ai",
     tasks=None,
 ) -> Report:
-    """生成日报对象（Markdown + HTML）。
-
-    已移除的参数（v3 遗留）：
-      - comparison：从未使用
-      - suggestions：从未使用
-      - events：从未使用
-      - work_classification：已由 formatter 内部重新分类
-    """
     generated_at = generated_at or datetime.now()
     md = _render_markdown(
         members, report_date, team_name, feishu_messages,

@@ -1,13 +1,17 @@
-"""智能日报生成器 — 主编排入口（v4.1）。
+"""智能日报生成器 — 主编排入口（v4.2：LLM 并行化）。
 
 用法:
-  python main.py                    # 完整流程：采集 → 生成 → 推送
+  python main.py                    # 完整流程
   python main.py --auto             # 一键自动
   python main.py --auto --dry-run   # 采集+生成，不推送
-  python main.py --auto --reflect "..." --plan "..."   # 带用户反思
-  python main.py --auto --interactive                   # 交互式输入
   python main.py --check            # 健康检查
   python main.py --github-only      # 只采集 GitHub
+
+用户输入（覆盖 AI 草稿）:
+  --reflect "..."     今日反思
+  --plan "..."        明日计划
+  --interactive       交互式输入
+  manual_input.md     本地文件（自动读）
 """
 
 from __future__ import annotations
@@ -17,8 +21,10 @@ import os
 import re
 import sys
 import time as _time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +66,9 @@ DEFAULT_MANUAL_FILE = "manual_input.md"
 EMAIL_MAX_RETRIES = 2
 EMAIL_RETRY_INTERVAL = 5
 
+# LLM 并行度（同轮次内并发数）
+LLM_MAX_WORKERS = 3
+
 _OPEN_ID_NAME_MAP: dict[str, str] = {}
 
 
@@ -87,7 +96,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="一键自动：采集全部数据源，生成并发送")
     parser.add_argument("--to", action="append", default=None,
                         help="临时指定收件人邮箱，可重复")
-    # 用户输入
     parser.add_argument("--reflect", default=None,
                         help="今日反思（多行用 \\n 分隔），覆盖 AI 草稿")
     parser.add_argument("--plan", default=None,
@@ -125,7 +133,6 @@ def is_workday(cfg, day=None) -> bool:
 # ============ 用户输入 ============
 
 def _parse_multiline_text(text: str) -> list[str]:
-    """把一段多行文本拆成多条（跳过空行、去掉列表前缀）。"""
     if not text:
         return []
     out = []
@@ -141,10 +148,6 @@ def _parse_multiline_text(text: str) -> list[str]:
 
 
 def _parse_manual_file(path: str, today: date) -> dict | None:
-    """解析 manual_input.md。
-
-    返回 {"reflect": [...], "plan": [...], "date": "..."} 或 None。
-    """
     p = Path(path)
     if not p.exists():
         return None
@@ -197,7 +200,6 @@ def _parse_manual_file(path: str, today: date) -> dict | None:
 
 
 def _prompt_multiline(title: str) -> list[str]:
-    """交互式多行输入，输入 END 结束。"""
     print()
     print(f"===== {title} =====")
     print("（多行输入，空行会被忽略，输入 END 单独一行结束）")
@@ -217,11 +219,6 @@ def _prompt_multiline(title: str) -> list[str]:
 
 
 def _collect_user_input(args, today: date) -> dict:
-    """收集用户输入。
-
-    优先级：命令行 > 交互式 > 文件 > 无。
-    返回 {"reflect": [...], "plan": [...], "source": "cli|interactive|file|none"}
-    """
     cli_reflect = _parse_multiline_text(args.reflect or "")
     cli_plan = _parse_multiline_text(args.plan or "")
     if cli_reflect or cli_plan:
@@ -247,7 +244,6 @@ def _collect_user_input(args, today: date) -> dict:
 
 
 def _to_problems_list(texts: list[str], tag: str) -> list[dict]:
-    """把字符串列表转成 [{"text": ..., "tag": ...}]。"""
     return [{"text": t, "tag": tag} for t in texts if t and t.strip()]
 
 
@@ -587,7 +583,6 @@ def _resolve_recipients(cfg, override=None) -> list[str]:
 
 
 def _build_subject(cfg, report_date) -> str:
-    """构造邮件标题：研一+姓名+日期+智能日报。"""
     grade = cfg.email.get("subject_grade") or "研一"
     name = cfg.email.get("subject_name") or cfg.email.get("sender_name") or "刘雨可"
     date_str = report_date.strftime("%Y-%m-%d")
@@ -652,6 +647,94 @@ def _send_feishu_with_report(cfg, report, members, highlights, summary, subject)
         return False
 
 
+# ============ LLM 并行编排 ============
+
+def _run_llm_analysis(
+    members,
+    feishu_msgs,
+    report_date,
+    yesterday_payload,
+    recent_reflections,
+) -> dict:
+    """并行执行所有 LLM 分析。返回一个 dict 含全部结果。
+
+    3 轮并行：
+      轮 1（互不依赖）: commit_summaries + action_items
+      轮 2（依赖 commit_summaries）: summary + highlights + risks
+      轮 3（依赖 action_items+risks）: ai_problems + ai_next_plan
+    """
+    t0 = _time.time()
+
+    # ---- 轮 1 ----
+    logger.info(f"[LLM] 第 1 轮并行（2 个任务）")
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="llm1") as ex:
+        f_commit_sum = ex.submit(summarize_commits, members, report_date, 20)
+        f_action = ex.submit(extract_action_items, members, feishu_msgs, report_date, 5)
+
+        commit_summaries = f_commit_sum.result() or {}
+        action_items = f_action.result() or []
+
+    t1 = _time.time()
+    logger.info(f"[LLM] 第 1 轮完成，耗时 {t1 - t0:.1f}s")
+
+    # ---- 轮 2 ----
+    logger.info(f"[LLM] 第 2 轮并行（3 个任务）")
+    with ThreadPoolExecutor(max_workers=LLM_MAX_WORKERS, thread_name_prefix="llm2") as ex:
+        f_sum = ex.submit(
+            partial(summarize, members, feishu_msgs, report_date,
+                    commit_summaries=commit_summaries)
+        )
+        f_high = ex.submit(
+            partial(extract_highlights, members, feishu_msgs, report_date,
+                    top_n=3, commit_summaries=commit_summaries)
+        )
+        f_risks = ex.submit(
+            generate_risks,
+            members, feishu_msgs, commit_summaries,
+            yesterday_payload, report_date,
+        )
+
+        summary = f_sum.result() or ""
+        highlights = f_high.result() or []
+        risks = f_risks.result() or []
+
+    t2 = _time.time()
+    logger.info(f"[LLM] 第 2 轮完成，耗时 {t2 - t1:.1f}s")
+
+    # ---- 轮 3 ----
+    logger.info(f"[LLM] 第 3 轮并行（2 个任务）")
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="llm3") as ex:
+        f_prob = ex.submit(
+            partial(generate_problems, members, feishu_msgs,
+                    action_items, risks, yesterday_payload, report_date,
+                    recent_reflections=recent_reflections, max_items=5)
+        )
+        f_plan = ex.submit(
+            partial(generate_next_plan, members, feishu_msgs,
+                    action_items, risks, yesterday_payload, report_date,
+                    recent_reflections=recent_reflections, max_items=4)
+        )
+
+        ai_problems = f_prob.result() or []
+        ai_next_plan = f_plan.result() or []
+
+    t3 = _time.time()
+    logger.info(f"[LLM] 第 3 轮完成，耗时 {t3 - t2:.1f}s")
+    logger.info(f"[LLM] 全部完成，总耗时 {t3 - t0:.1f}s（原先串行约 60-100s）")
+
+    return {
+        "commit_summaries": commit_summaries,
+        "action_items": action_items,
+        "summary": summary,
+        "highlights": highlights,
+        "risks": risks,
+        "ai_problems": ai_problems,
+        "ai_next_plan": ai_next_plan,
+    }
+
+
+# ============ 主流程 ============
+
 def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
                      github_only=False, recipients_override=None,
                      user_input: dict | None = None) -> PipelineOutcome:
@@ -703,37 +786,25 @@ def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
         issue_number = 0
     logger.info(f"日报期数: 第 {issue_number} 期" if issue_number else "未取到期数")
 
-    # 读近 7 天反思（用于 LLM 学习风格）
+    # 读近 7 天反思
     recent_reflections = storage.get_recent_reflections(
         days=7, end_date=until.date(), only_user_written=True,
     )
     logger.info(f"近 7 天用户真实反思: {len(recent_reflections)} 天")
 
-    # ====== LLM 分析 ======
-    summary = summarize(members, feishu_msgs, until.date()) or ""
-    highlights = extract_highlights(members, feishu_msgs, until.date(), top_n=3)
-    action_items = extract_action_items(members, feishu_msgs, until.date(), max_items=5)
-    commit_summaries = summarize_commits(members, until.date(), max_commits=20)
+    # ====== LLM 分析（3 轮并行）======
+    llm_results = _run_llm_analysis(
+        members, feishu_msgs, until.date(),
+        yesterday_payload, recent_reflections,
+    )
 
-    risks = generate_risks(
-        members, feishu_msgs, commit_summaries,
-        yesterday_payload, until.date(),
-    ) or []
-
-    # ====== AI 草稿：问题与思考 + 明日计划 ======
-    ai_problems = generate_problems(
-        members, feishu_msgs, action_items, risks,
-        yesterday_payload, until.date(),
-        recent_reflections=recent_reflections,
-        max_items=5,
-    ) or []
-
-    ai_next_plan = generate_next_plan(
-        members, feishu_msgs, action_items, risks,
-        yesterday_payload, until.date(),
-        recent_reflections=recent_reflections,
-        max_items=4,
-    ) or []
+    summary = llm_results["summary"]
+    highlights = llm_results["highlights"]
+    action_items = llm_results["action_items"]
+    commit_summaries = llm_results["commit_summaries"]
+    risks = llm_results["risks"]
+    ai_problems = llm_results["ai_problems"]
+    ai_next_plan = llm_results["ai_next_plan"]
 
     logger.info(f"AI 草稿：问题 {len(ai_problems)} 条，计划 {len(ai_next_plan)} 条")
 
@@ -850,7 +921,6 @@ def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
             sender=sender, recipients=recipients,
         )
 
-    # 推邮件
     email_ok = False
     try:
         logger.info(f"准备发送日报邮件 | 主题: {subject} | 收件人: {recipients}")
@@ -859,7 +929,6 @@ def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
     except ConfigError as exc:
         logger.error(f"邮件推送跳过: {exc}")
 
-    # 推飞书
     feishu_ok = _send_feishu_with_report(
         cfg, report, members, highlights, summary, subject,
     )

@@ -2,13 +2,15 @@
 
 包含：
   1. summarize               一句话结论
-  2. extract_highlights      今日亮点 Top N
+  2. extract_highlights      今日亮点（基于 AI 摘要，更具体）
   3. extract_action_items    群讨论要点（决策 / 待办 / 问题）
   4. summarize_commits       commit diff 摘要
   5. compare_with_yesterday  相比昨天变化分析
   6. generate_risks          风险与待办
   7. generate_problems       问题与思考（参考历史风格）
   8. generate_next_plan      明日计划（参考历史风格）
+
+commit 分类统一由 generator/classify.py 提供，避免与 formatter 打架。
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ from datetime import datetime
 
 import httpx
 
+from generator.classify import classify_commit_message
 from shared.logger import get_logger
 
 logger = get_logger("daily_report.generator.summarizer")
@@ -178,9 +181,31 @@ def _format_history_reflections(reflections: list, max_days: int = 7) -> str:
     return "\n".join(items)
 
 
+def _build_commit_summary_lines(members, commit_summaries: dict) -> list:
+    """生成"提交摘要"提示行，用于亮点/总结等 prompt。
+
+    优先用 AI 摘要，没有就用 commit message。
+    """
+    lines = []
+    for m in members:
+        for c in (getattr(m, "commits", None) or []):
+            sha = getattr(c, "sha", "") or ""
+            ai_sum = (commit_summaries or {}).get(sha, "").strip()
+            msg = (getattr(c, "message", "") or "").strip().splitlines()[0]
+            time_str = _fmt_time(getattr(c, "timestamp", None))
+            text = ai_sum if ai_sum else msg
+            lines.append(f"- [{time_str}] {text}")
+    return lines
+
+
 # ============ 1. 一句话结论 ============
 
-def summarize(members, feishu_messages, report_date) -> str | None:
+def summarize(members, feishu_messages, report_date, commit_summaries: dict | None = None) -> str | None:
+    """生成一句话结论。
+
+    Args:
+        commit_summaries: AI 生成的 commit 摘要（可选）。有则优先用它。
+    """
     api_key = os.environ.get(_API_KEY_ENV, "").strip()
     if not api_key:
         logger.info("未配置 DEEPSEEK_API_KEY，跳过一句话结论")
@@ -193,6 +218,24 @@ def summarize(members, feishu_messages, report_date) -> str | None:
     data_prompt = _build_prompt(members, feishu_messages, report_date)
     has_msg = bool(feishu_messages)
 
+    number_rule = (
+        "【数字格式】"
+        "① 提到代码量时必须写成『+X / -Y 行』的形式，"
+        "例如：+672 / -293 行；"
+        "② 绝对不要写成『改动 965 行』这种把增加和删除相加的形式；"
+        "③ 涉及『次』『个』的计数，直接用阿拉伯数字 + 单位，"
+        "例如：4 个文件、1 次提交。"
+    )
+
+    no_empty_rule = (
+        "【禁止废话】"
+        "① 不要写『无群消息等其他进展』『当日唯一代码活动』这类句式；"
+        "② 没有的内容直接不提，不要主动声明『没有 X』；"
+        "③ 不要用『标志着』『体现了』『彰显了』这种空洞表述。"
+    )
+
+    punctuation_rule = "【标点】所有句子以中文句号『。』结尾。"
+
     if has_msg and has_any:
         instruction = (
             "请根据以上信息，用中文写一段 2-3 句的『一句话结论』。"
@@ -201,17 +244,20 @@ def summarize(members, feishu_messages, report_date) -> str | None:
             "② 说清楚进展（完成了什么、进入了什么状态）；"
             "③ 语气正式，像管理层汇报；"
             "④ 不要用 markdown、不要 emoji，直接输出。"
+            + number_rule + no_empty_rule + punctuation_rule
         )
     elif has_any:
         instruction = (
             "请根据以上信息，用中文写一段 2-3 句的『一句话结论』。"
             "结论先行，突出今天最重要的成果和进展；"
             "不要用 markdown、不要 emoji，直接输出。"
+            + number_rule + no_empty_rule + punctuation_rule
         )
     else:
         instruction = (
             "请根据以上信息，用中文写一段 2 句的『一句话结论』。"
             "概括群里讨论的主要内容；不要 emoji，直接输出。"
+            + punctuation_rule
         )
 
     content = _call_llm(
@@ -224,9 +270,20 @@ def summarize(members, feishu_messages, report_date) -> str | None:
     return content
 
 
-# ============ 2. 今日亮点 ============
+# ============ 2. 今日亮点（基于 AI 摘要） ============
 
-def extract_highlights(members, feishu_messages, report_date, top_n: int = 3) -> list[str]:
+def extract_highlights(
+    members,
+    feishu_messages,
+    report_date,
+    top_n: int = 3,
+    commit_summaries: dict | None = None,
+) -> list[str]:
+    """生成今日亮点。
+
+    优先使用 AI 生成的 commit 摘要（读了 diff，更具体），
+    没有摘要时才退回 commit message。
+    """
     api_key = os.environ.get(_API_KEY_ENV, "").strip()
     if not api_key:
         return []
@@ -235,18 +292,41 @@ def extract_highlights(members, feishu_messages, report_date, top_n: int = 3) ->
     if not has_any and not feishu_messages:
         return []
 
-    data_prompt = _build_prompt(members, feishu_messages, report_date)
+    summary_lines = _build_commit_summary_lines(members, commit_summaries or {})
+
+    lines = [f"日期：{report_date.isoformat()}（北京时间）", ""]
+    lines.append("【今日提交（含 AI 摘要）】")
+    if summary_lines:
+        lines.extend(summary_lines)
+    else:
+        lines.append("（无）")
+    lines.append("")
+
+    if feishu_messages:
+        lines.append("【群消息】")
+        for msg in feishu_messages[:10]:
+            sender = getattr(msg, "sender_name", "") or "未知"
+            text = (getattr(msg, "text", "") or "").replace("\n", " ").strip()
+            lines.append(f"- {sender}：{text}")
+        lines.append("")
+
+    data_prompt = "\n".join(lines)
+
     instruction = (
-        f"请从以上信息中提炼今天最重要的 {top_n} 条工作亮点。"
+        f"请从以上『提交摘要』中提炼今天最重要的 {top_n} 条工作亮点。"
         "要求："
         "① 每条 20-40 字；"
-        "② 突出【做了什么功能 / 改了什么 bug / 加了什么能力】，不要罗列数字；"
-        "③ 不要写『完成了工作』『代码提交完成』这类空话；"
+        "② 直接引用摘要里的具体内容（功能名 / 模块名 / 改动点），"
+        "不要抽象成『提升可靠性』『增强能力』这种空话；"
+        "③ 不要把一条摘要拆成多条，也不要编造摘要里没有的东西；"
         "④ 不要用 markdown、不要 emoji、不要加序号前缀；"
-        "⑤ 严格输出 JSON 字符串数组，例如："
-        '["日报结构重构为五段式周报格式", "新增工作建议和分类统计能力"]'
-        "；⑥ 只输出 JSON。"
+        "⑤ 所有句子以中文句号『。』结尾；"
+        "⑥ 严格输出 JSON 字符串数组，例如："
+        '["新增分类规则与分类概览渲染，支持按性质分类统计。",'
+        ' "移除旧分类统计函数，简化 summarizer 模块逻辑。"]'
+        "；⑦ 只输出 JSON。"
     )
+
     content = _call_llm(
         data_prompt + "\n" + instruction,
         system="你是一个专业的技术日报助手，擅长提炼关键成果。",
@@ -284,10 +364,11 @@ def extract_action_items(members, feishu_messages, report_date, max_items: int =
         "③ 每条要识别『相关人』（谁负责/谁参与），放 'people' 字段，"
         "如果全员相关就写 '全员'；"
         "④ 只提取真正有价值的，最多 5 条；无内容时返回空数组；"
-        "⑤ 严格输出 JSON 数组，例如："
-        '[{"type":"decision","text":"日报每天18:00自动发送","people":"全员"},'
-        '{"type":"todo","text":"本周完成Web面板","people":"刘雨可"}]'
-        "；⑥ 只输出 JSON，不要 emoji。"
+        "⑤ 所有句子以中文句号『。』结尾；"
+        "⑥ 严格输出 JSON 数组，例如："
+        '[{"type":"decision","text":"日报每天18:00自动发送。","people":"全员"},'
+        '{"type":"todo","text":"本周完成Web面板。","people":"刘雨可"}]'
+        "；⑦ 只输出 JSON，不要 emoji。"
     )
     content = _call_llm(
         data_prompt + "\n" + instruction,
@@ -344,7 +425,8 @@ def summarize_commits(members, report_date, max_commits: int = 20) -> dict[str, 
             "要求："
             "① 从 diff 内容出发，说人话，不要重复 commit message；"
             "② 突出『新增了什么』『修复了什么』『改动了什么逻辑』；"
-            "③ 不要用 markdown、不要 emoji，直接输出一句话。"
+            "③ 尽量带上具体的模块名 / 功能名，方便后续引用；"
+            "④ 不要用 markdown、不要 emoji，直接输出一句话。"
         )
         content = _call_llm(
             prompt,
@@ -445,7 +527,8 @@ def compare_with_yesterday(
         "③ changes：2-3 条要点，每条 ≤ 40 字；"
         "④ trend：从这 5 个里选一个——"
         "'功能推进'、'修复完善'、'重构优化'、'文档维护'、'常规迭代'；"
-        "⑤ 不要 emoji，只输出 JSON。"
+        "⑤ 所有句子以中文句号『。』结尾；"
+        "⑥ 不要 emoji，只输出 JSON。"
     )
 
     content = _call_llm(
@@ -468,43 +551,7 @@ def compare_with_yesterday(
     return result
 
 
-# ============ 6. commit 分类（仅用于 generate_risks 内部的规范检测） ============
-
-_CATEGORY_DEFS = [
-    ("feat", "新功能"),
-    ("fix", "修复"),
-    ("refactor", "重构"),
-    ("docs", "文档"),
-    ("test", "测试"),
-    ("chore", "配置"),
-    ("style", "样式"),
-    ("perf", "性能"),
-    ("ci", "CI/CD"),
-    ("build", "构建"),
-    ("revert", "回滚"),
-    ("cleanup", "清理"),
-]
-
-
-def _classify_commit_message(msg: str) -> str | None:
-    """仅用于 generate_risks 里的『commit message 规范』检测。
-    返回类别 key，命中不了返回 None。
-    """
-    if not msg:
-        return None
-    m = msg.strip().lower()
-    m = re.sub(r"^([a-z]+)\s*\([^)]*\)\s*:", r"\1:", m)
-    for prefix, _ in _CATEGORY_DEFS:
-        if m.startswith(prefix + ":") or m.startswith(prefix + " "):
-            return prefix
-    if any(k in m for k in ["delete", "remove", "清理", "删除"]):
-        return "cleanup"
-    if any(k in m for k in ["update", "更新"]):
-        return "_other"
-    return None
-
-
-# ============ 7. 风险与待办 ============
+# ============ 6. 风险与待办 ============
 
 _BAD_FILE_PATTERNS = [
     (re.compile(r"(^|/)logs?/.*\.log$"), "日志文件", "加入 .gitignore：`logs/` 或 `*.log`"),
@@ -548,7 +595,7 @@ def generate_risks(
 
     risks: list[dict] = []
 
-    # 误提交文件检测
+    # 误提交文件检测（本地规则）
     bad_files = _detect_bad_files(members)
     for bf in bad_files:
         sample = "、".join(bf["files"][:3])
@@ -556,25 +603,25 @@ def generate_risks(
             sample += f" 等 {len(bf['files'])} 个"
         risks.append({
             "category": "数据质量",
-            "text": f"检测到误提交的{bf['name']}（{sample}），{bf['fix']}",
+            "text": f"检测到误提交的{bf['name']}（{sample}），{bf['fix']}。",
         })
 
-    # commit message 规范检测
+    # commit message 规范检测（用统一分类器）
     all_commits = [c for m in members for c in (getattr(m, "commits", None) or [])]
     bad_msgs = []
     for c in all_commits:
         msg = (getattr(c, "message", "") or "").strip().splitlines()[0]
         if not msg:
             continue
-        key = _classify_commit_message(msg)
-        if key is None or key == "_other":
+        key = classify_commit_message(msg)
+        if key is None:      # 完全不认识才算不规范
             bad_msgs.append(msg)
     if len(bad_msgs) >= 2 or (all_commits and len(bad_msgs) / max(len(all_commits), 1) > 0.5):
         sample = "、".join(f"「{m}」" for m in bad_msgs[:3])
         risks.append({
             "category": "数据质量",
             "text": f"commit message 不规范（如 {sample}），"
-                    f"建议统一使用 feat / fix / refactor 前缀，便于分类统计",
+                    f"建议统一使用 feat / fix / refactor 前缀，便于分类统计。",
         })
 
     # LLM 补充
@@ -601,18 +648,24 @@ def generate_risks(
                 lines.append(f"- {sender}：{text}")
             lines.append("")
 
+        already_lines = [f"  {i}. {r['text']}" for i, r in enumerate(risks, 1)]
+        already_block = "\n".join(already_lines) if already_lines else "（无）"
+
         instruction = (
-            "请根据以上信息，识别今天的『风险与待办』（最多 4 条）。"
+            "请根据以上信息，识别今天的『风险与待办』（最多 3 条）。"
             "要求："
             "① 严格输出 JSON 数组，格式："
-            '[{"category": "稳定性", "text": "..."}, '
-            '{"category": "待办事项", "text": "..."}]'
+            '[{"category": "稳定性", "text": "..."}]'
             "；"
             "② category 从这些里选："
             "'稳定性'、'数据质量'、'待办事项'、'进度风险'；"
             "③ text 要具体、可执行，不超过 60 字；"
-            "④ 没有风险就返回空数组；"
-            "⑤ 不要 emoji，只输出 JSON。"
+            "④ 所有句子以中文句号『。』结尾；"
+            "⑤ 【关键】以下风险已经由本地规则识别，"
+            "不要生成语义上重复的条目（即使用词不同，只要说的是同一件事也算重复）："
+            f"\n{already_block}\n"
+            "⑥ 没有新的风险就返回空数组；"
+            "⑦ 不要 emoji，只输出 JSON。"
         )
 
         content = _call_llm(
@@ -644,7 +697,7 @@ def generate_risks(
     return unique[:5]
 
 
-# ============ 8. 问题与思考 ============
+# ============ 7. 问题与思考 ============
 
 def generate_problems(
     members,
@@ -724,10 +777,11 @@ def generate_problems(
         "；"
         "② 每条 30-80 字，说清楚『遇到了什么问题』或『有什么反思』；"
         "③ 语气：像写给自己的工作笔记，不要空话、不要口号；"
-        "④ 优先从以下角度思考："
+        "④ 所有句子以中文句号『。』结尾；"
+        "⑤ 优先从以下角度思考："
         "『今天哪里卡住了』『哪个决定做错了』『哪个技术点值得深挖』"
         "『数据质量哪里出了问题』；"
-        "⑤ 不要 emoji，只输出 JSON。"
+        "⑥ 不要 emoji，只输出 JSON。"
     )
 
     content = _call_llm(
@@ -752,7 +806,7 @@ def generate_problems(
     return result[:max_items]
 
 
-# ============ 9. 明日计划 ============
+# ============ 8. 明日计划 ============
 
 def generate_next_plan(
     members,
@@ -817,12 +871,13 @@ def generate_next_plan(
         f"请根据以上信息，生成 {max_items} 条明日计划。"
         "要求："
         "① 严格输出 JSON 数组，格式："
-        '[{"text": "把工作建议渲染进日报", "tag": "推测"}]'
+        '[{"text": "把工作建议渲染进日报。", "tag": "推测"}]'
         "；"
         "② 每条不超过 30 字；"
         "③ 具体、可执行，说清楚『要做什么』，避免『继续推进』这种虚词；"
-        "④ 优先级：先待办/风险，再新功能；"
-        "⑤ 不要 emoji，只输出 JSON。"
+        "④ 所有句子以中文句号『。』结尾；"
+        "⑤ 优先级：先待办/风险，再新功能；"
+        "⑥ 不要 emoji，只输出 JSON。"
     )
 
     content = _call_llm(
