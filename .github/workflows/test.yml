@@ -1,6 +1,5 @@
 name: Run Tests
 
-# 触发条件：当你 push 代码或发起 PR 时自动运行
 on:
   push:
     branches: [ "main", "master" ]
@@ -19,13 +18,12 @@ jobs:
       uses: actions/setup-python@v5
       with:
         python-version: "3.11"
-        cache: 'pip' # 缓存依赖加速后续运行
+        cache: 'pip'
 
     - name: 安装依赖
       run: |
         python -m pip install --upgrade pip
-        pip install pytest httpx pyyaml python-dotenv
-        # 如果你的项目需要其他依赖，请在这里加上，比如：pip install -e .
+        pip install pytest httpx pyyaml python-dotenv jinja2
 
     - name: 运行测试
       run: |
