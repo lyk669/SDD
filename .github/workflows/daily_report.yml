@@ -2,8 +2,8 @@ name: Daily Report Auto Send
 
 on:
   # 临时开启 push 触发：你一推代码就会跑一次，方便验证。验证成功后可以把下面两行删掉。
-  push:
-    branches: [ "master" ]
+  #push:
+    #branches: [ "master" ]
   
   # 定时触发：每天 UTC 10:00 (北京时间 18:00) 自动运行
   schedule:
