@@ -4,13 +4,13 @@
   1. summarize               一句话结论
   2. extract_highlights      今日亮点（基于 AI 摘要，更具体）
   3. extract_action_items    群讨论要点（决策 / 待办 / 问题）
-  4. summarize_commits       commit diff 摘要
+  4. summarize_commits       commit diff 摘要（batch + 并行）
   5. compare_with_yesterday  相比昨天变化分析
   6. generate_risks          风险与待办
   7. generate_problems       问题与思考（参考历史风格）
   8. generate_next_plan      明日计划（参考历史风格）
 
-commit 分类统一由 generator/classify.py 提供，避免与 formatter 打架。
+commit 分类统一由 generator/classify.py 提供。
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ import json
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import httpx
@@ -34,6 +35,11 @@ _MODEL_ENV = "DEEPSEEK_MODEL"
 
 _DEFAULT_BASE_URL = "https://api.deepseek.com"
 _DEFAULT_MODEL = "deepseek-chat"
+
+# summarize_commits 批量参数
+_COMMIT_BATCH_SIZE = 5           # 每批最多几条 commit
+_COMMIT_BATCH_WORKERS = 3        # 最多几个 batch 同时跑
+_COMMIT_PATCH_PER_ITEM = 1500    # 每条 diff 最多保留多少字符
 
 
 # ---------- 通用工具 ----------
@@ -125,7 +131,6 @@ def _parse_json(text: str, kind: str = "array"):
 
 
 def _build_prompt(members, feishu_messages, report_date) -> str:
-    """通用 prompt：把今天的 commit / 群消息整理成文本。"""
     lines = [f"日期：{report_date.isoformat()}（北京时间）", ""]
 
     lines.append("【代码提交】")
@@ -159,7 +164,6 @@ def _build_prompt(members, feishu_messages, report_date) -> str:
 
 
 def _format_history_reflections(reflections: list, max_days: int = 7) -> str:
-    """把历史反思格式化成 prompt 里的"风格参考"。"""
     if not reflections:
         return ""
     items = []
@@ -182,10 +186,7 @@ def _format_history_reflections(reflections: list, max_days: int = 7) -> str:
 
 
 def _build_commit_summary_lines(members, commit_summaries: dict) -> list:
-    """生成"提交摘要"提示行，用于亮点/总结等 prompt。
-
-    优先用 AI 摘要，没有就用 commit message。
-    """
+    """用于亮点/总结等 prompt。优先用 AI 摘要，没有就用 commit message。"""
     lines = []
     for m in members:
         for c in (getattr(m, "commits", None) or []):
@@ -201,11 +202,6 @@ def _build_commit_summary_lines(members, commit_summaries: dict) -> list:
 # ============ 1. 一句话结论 ============
 
 def summarize(members, feishu_messages, report_date, commit_summaries: dict | None = None) -> str | None:
-    """生成一句话结论。
-
-    Args:
-        commit_summaries: AI 生成的 commit 摘要（可选）。有则优先用它。
-    """
     api_key = os.environ.get(_API_KEY_ENV, "").strip()
     if not api_key:
         logger.info("未配置 DEEPSEEK_API_KEY，跳过一句话结论")
@@ -226,14 +222,12 @@ def summarize(members, feishu_messages, report_date, commit_summaries: dict | No
         "③ 涉及『次』『个』的计数，直接用阿拉伯数字 + 单位，"
         "例如：4 个文件、1 次提交。"
     )
-
     no_empty_rule = (
         "【禁止废话】"
         "① 不要写『无群消息等其他进展』『当日唯一代码活动』这类句式；"
         "② 没有的内容直接不提，不要主动声明『没有 X』；"
         "③ 不要用『标志着』『体现了』『彰显了』这种空洞表述。"
     )
-
     punctuation_rule = "【标点】所有句子以中文句号『。』结尾。"
 
     if has_msg and has_any:
@@ -270,7 +264,7 @@ def summarize(members, feishu_messages, report_date, commit_summaries: dict | No
     return content
 
 
-# ============ 2. 今日亮点（基于 AI 摘要） ============
+# ============ 2. 今日亮点 ============
 
 def extract_highlights(
     members,
@@ -279,11 +273,6 @@ def extract_highlights(
     top_n: int = 3,
     commit_summaries: dict | None = None,
 ) -> list[str]:
-    """生成今日亮点。
-
-    优先使用 AI 生成的 commit 摘要（读了 diff，更具体），
-    没有摘要时才退回 commit message。
-    """
     api_key = os.environ.get(_API_KEY_ENV, "").strip()
     if not api_key:
         return []
@@ -392,9 +381,66 @@ def extract_action_items(members, feishu_messages, report_date, max_items: int =
     return result[:max_items]
 
 
-# ============ 4. commit diff 摘要 ============
+# ============ 4. commit diff 摘要（batch + 并行） ============
 
-def summarize_commits(members, report_date, max_commits: int = 20) -> dict[str, str]:
+def _summarize_one_batch(batch: list, report_date) -> dict:
+    """处理一个 batch（≤ _COMMIT_BATCH_SIZE 条 commit），返回 {sha: 摘要}。"""
+    parts = []
+    for i, c in enumerate(batch, 1):
+        sha = getattr(c, "sha", "") or ""
+        msg = (getattr(c, "message", "") or "").strip().splitlines()[0]
+        patch = (getattr(c, "patch_text", "") or "").strip()
+        if len(patch) > _COMMIT_PATCH_PER_ITEM:
+            patch = patch[:_COMMIT_PATCH_PER_ITEM] + "\n…（已截断）"
+        parts.append(
+            f"【Commit {i}】\n"
+            f"sha: {sha}\n"
+            f"message: {msg}\n"
+            f"diff:\n{patch}\n"
+        )
+    data_prompt = "\n".join(parts)
+
+    instruction = (
+        "以上是今天的一批 commit。请为每一条生成一句中文摘要（不超过 60 字），"
+        "从 diff 内容出发，突出『新增 / 修复 / 改动』的具体内容。"
+        "要求："
+        "① 严格输出 JSON 对象，key 是 commit 的 sha，value 是摘要字符串；"
+        "② 不要用 markdown、不要 emoji；"
+        "③ 摘要里尽量带上具体的模块名 / 功能名；"
+        "④ 只输出 JSON，不要其它文字。\n"
+        '示例：{"abc1234": "重构日报生成器，新增分类规则。", '
+        '"def5678": "修复时区归组 bug。"}'
+    )
+
+    content = _call_llm(
+        data_prompt + "\n" + instruction,
+        system="你是一个代码审查助手，擅长用一句话概括代码改动。",
+        max_tokens=1500,
+    )
+    data = _parse_json(content or "", "object")
+    if not isinstance(data, dict):
+        return {}
+    return {
+        str(k): str(v).replace("\n", " ").strip()
+        for k, v in data.items()
+        if str(v).strip()
+    }
+
+
+def summarize_commits(
+    members,
+    report_date,
+    max_commits: int = 20,
+    batch_size: int = _COMMIT_BATCH_SIZE,
+    max_workers: int = _COMMIT_BATCH_WORKERS,
+) -> dict[str, str]:
+    """为每条 commit 生成 diff 摘要。
+
+    批量 + 并行：
+      1. 每 batch_size 条打成一个 batch
+      2. batch 之间并行（最多 max_workers 个）
+      3. LLM 一次返回 JSON map {sha: 摘要}
+    """
     api_key = os.environ.get(_API_KEY_ENV, "").strip()
     if not api_key:
         return {}
@@ -412,31 +458,36 @@ def summarize_commits(members, report_date, max_commits: int = 20) -> dict[str, 
         logger.info("无 diff 数据，跳过 commit 摘要")
         return {}
 
+    # 分组
+    batches = [
+        targets[i:i + batch_size]
+        for i in range(0, len(targets), batch_size)
+    ]
+    logger.info(
+        f"commit 摘要批处理: {len(targets)} 条 → {len(batches)} 个 batch "
+        f"（每 batch ≤ {batch_size} 条，最多 {max_workers} 并发）"
+    )
+
     results: dict[str, str] = {}
-    for c in targets:
-        sha = c.sha
-        msg = (getattr(c, "message", "") or "").strip().splitlines()[0]
-        patch = c.patch_text
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=max_workers,
+                            thread_name_prefix="commit_sum") as ex:
+        futures = {
+            ex.submit(_summarize_one_batch, batch, report_date): batch
+            for batch in batches
+        }
+        for fut in as_completed(futures):
+            batch = futures[fut]
+            try:
+                partial_map = fut.result() or {}
+                results.update(partial_map)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"batch 摘要失败（{len(batch)} 条）: {exc}")
 
-        prompt = (
-            f"【Commit message】{msg}\n\n"
-            f"【Diff】\n{patch}\n\n"
-            "请用一句中文（不超过 60 字）概括这次提交具体做了什么改动。"
-            "要求："
-            "① 从 diff 内容出发，说人话，不要重复 commit message；"
-            "② 突出『新增了什么』『修复了什么』『改动了什么逻辑』；"
-            "③ 尽量带上具体的模块名 / 功能名，方便后续引用；"
-            "④ 不要用 markdown、不要 emoji，直接输出一句话。"
-        )
-        content = _call_llm(
-            prompt,
-            system="你是一个代码审查助手，擅长用一句话概括代码改动。",
-            max_tokens=200,
-        )
-        if content:
-            results[sha] = content.replace("\n", " ").strip()
-
-    logger.info(f"commit 摘要生成成功（{len(results)}/{len(targets)} 条）")
+    logger.info(
+        f"commit 摘要生成成功（{len(results)}/{len(targets)} 条，"
+        f"耗时 {time.time() - t0:.1f}s）"
+    )
     return results
 
 
@@ -588,14 +639,12 @@ def generate_risks(
     yesterday_payload: dict | None,
     report_date,
 ) -> list[dict]:
-    """生成风险与待办。返回 [{"category": "...", "text": "..."}]"""
     api_key = os.environ.get(_API_KEY_ENV, "").strip()
     if not api_key:
         return []
 
     risks: list[dict] = []
 
-    # 误提交文件检测（本地规则）
     bad_files = _detect_bad_files(members)
     for bf in bad_files:
         sample = "、".join(bf["files"][:3])
@@ -606,7 +655,6 @@ def generate_risks(
             "text": f"检测到误提交的{bf['name']}（{sample}），{bf['fix']}。",
         })
 
-    # commit message 规范检测（用统一分类器）
     all_commits = [c for m in members for c in (getattr(m, "commits", None) or [])]
     bad_msgs = []
     for c in all_commits:
@@ -614,7 +662,7 @@ def generate_risks(
         if not msg:
             continue
         key = classify_commit_message(msg)
-        if key is None:      # 完全不认识才算不规范
+        if key is None:
             bad_msgs.append(msg)
     if len(bad_msgs) >= 2 or (all_commits and len(bad_msgs) / max(len(all_commits), 1) > 0.5):
         sample = "、".join(f"「{m}」" for m in bad_msgs[:3])
@@ -624,7 +672,6 @@ def generate_risks(
                     f"建议统一使用 feat / fix / refactor 前缀，便于分类统计。",
         })
 
-    # LLM 补充
     if all_commits or feishu_messages:
         lines = [f"日期：{report_date.isoformat()}", ""]
         lines.append("【今日代码提交】")
@@ -683,7 +730,6 @@ def generate_risks(
                 if cat and text:
                     risks.append({"category": cat, "text": text})
 
-    # 去重
     seen = set()
     unique = []
     for r in risks:
@@ -710,7 +756,6 @@ def generate_problems(
     recent_reflections: list[dict] | None = None,
     max_items: int = 5,
 ) -> list[dict]:
-    """生成「问题与思考」。返回 [{"text": "...", "tag": "推测"}]。"""
     api_key = os.environ.get(_API_KEY_ENV, "").strip()
     if not api_key:
         return []
@@ -819,7 +864,6 @@ def generate_next_plan(
     recent_reflections: list[dict] | None = None,
     max_items: int = 4,
 ) -> list[dict]:
-    """生成明日计划。返回 [{"text": "...", "tag": "推测"}]。"""
     api_key = os.environ.get(_API_KEY_ENV, "").strip()
     if not api_key:
         return []

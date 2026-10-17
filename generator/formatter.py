@@ -1,4 +1,9 @@
-"""日报生成器 — 输出 Markdown + HTML（企业周报风格 v4.2，无 emoji）。
+"""日报生成器 — 输出 Markdown + HTML（企业周报风格 v4.3，无 emoji）。
+
+v4.3 改动：
+  - generate() 里一次性构建 model（metrics / work / task_changes / risks_grouped）
+  - _render_markdown / _render_html 从 model 里读数据，不再各自重算
+  - 消除了「同一份分析算两遍」的重复计算
 
 结构：
   # 标题 + 日期期数
@@ -129,7 +134,21 @@ def _delta_str(cur: int, prev):
     return f"{sign} {abs(pct):.1f}%"
 
 
-def _compute_metrics(members, feishu_messages, tasks, yesterday_stats, feishu_stats):
+def _texts_of_items(items) -> list:
+    out = []
+    for it in (items or []):
+        if isinstance(it, dict):
+            t = (it.get("text") or "").strip()
+        else:
+            t = str(it).strip()
+        if t:
+            out.append(t)
+    return out
+
+
+# ============ 数据计算（一次性） ============
+
+def _compute_metrics(members, feishu_messages, tasks, yesterday_stats, feishu_stats) -> dict:
     all_commits = [c for m in members for c in (getattr(m, "commits", []) or [])]
     total_files = sum(int(getattr(c, "files_changed", 0) or 0) for c in all_commits)
     total_add = sum(int(getattr(c, "additions", 0) or 0) for c in all_commits)
@@ -162,51 +181,6 @@ def _compute_metrics(members, feishu_messages, tasks, yesterday_stats, feishu_st
     return {"today": today, "yesterday": yest}
 
 
-def _group_risks_by_category(risks: list) -> dict:
-    result: dict[str, list[str]] = {}
-    for r in (risks or []):
-        cat = (r.get("category") or "其他").strip()
-        text = (r.get("text") or "").strip()
-        if not text:
-            continue
-        result.setdefault(cat, []).append(text)
-    return result
-
-
-def _extract_task_changes(tasks) -> list:
-    out = []
-    for t in (getattr(tasks, "records", []) or []):
-        title = getattr(t, "title", "") or ""
-        assignee = getattr(t, "assignee", "") or "-"
-        sf = getattr(t, "status_from", "") or "—"
-        st = getattr(t, "status_to", "") or "—"
-        ts = _fmt_time(getattr(t, "updated_at", None))
-        if not title:
-            continue
-        out.append({
-            "title": title,
-            "assignee": assignee,
-            "status_from": sf,
-            "status_to": st,
-            "time": ts,
-        })
-    return out
-
-
-def _texts_of_items(items) -> list:
-    out = []
-    for it in (items or []):
-        if isinstance(it, dict):
-            t = (it.get("text") or "").strip()
-        else:
-            t = str(it).strip()
-        if t:
-            out.append(t)
-    return out
-
-
-# ============ 工作明细 ============
-
 def _build_work_summary(members: list, commit_summaries: dict) -> dict:
     """构建工作明细的数据结构。"""
     all_commits = [c for m in members for c in (getattr(m, "commits", []) or [])]
@@ -220,7 +194,6 @@ def _build_work_summary(members: list, commit_summaries: dict) -> dict:
             },
         }
 
-    # 分类统计（用统一分类器）
     from collections import defaultdict
     bucket: dict[str, list] = defaultdict(list)
     for c in all_commits:
@@ -234,14 +207,13 @@ def _build_work_summary(members: list, commit_summaries: dict) -> dict:
         count = len(items)
         percent = round(count / total * 100)
         categories.append({
-            "label": label_of(key),          # None → "其他"
+            "label": label_of(key),
             "count": count,
             "percent": percent,
             "commits": items,
         })
     categories.sort(key=lambda x: -x["count"])
 
-    # 逐条明细
     sorted_commits = sorted(
         all_commits,
         key=lambda c: getattr(c, "timestamp", None) or datetime.min,
@@ -308,8 +280,66 @@ def _build_work_summary(members: list, commit_summaries: dict) -> dict:
     }
 
 
+def _extract_task_changes(tasks) -> list:
+    out = []
+    for t in (getattr(tasks, "records", []) or []):
+        title = getattr(t, "title", "") or ""
+        assignee = getattr(t, "assignee", "") or "-"
+        sf = getattr(t, "status_from", "") or "—"
+        st = getattr(t, "status_to", "") or "—"
+        ts = _fmt_time(getattr(t, "updated_at", None))
+        if not title:
+            continue
+        out.append({
+            "title": title,
+            "assignee": assignee,
+            "status_from": sf,
+            "status_to": st,
+            "time": ts,
+        })
+    return out
+
+
+def _group_risks_by_category(risks: list) -> dict:
+    result: dict[str, list[str]] = {}
+    for r in (risks or []):
+        cat = (r.get("category") or "其他").strip()
+        text = (r.get("text") or "").strip()
+        if not text:
+            continue
+        result.setdefault(cat, []).append(text)
+    return result
+
+
+def _build_model(
+    members: list,
+    feishu_messages: list,
+    tasks,
+    yesterday_stats: dict | None,
+    feishu_stats: dict | None,
+    commit_summaries: dict | None,
+    risks: list | None,
+) -> dict:
+    """一次性构建所有渲染所需的数据。
+
+    v4.3 新增：把之前分别跑两遍的计算合并成一份。
+    """
+    feishu_stats = feishu_stats or {}
+    commit_summaries = commit_summaries or {}
+    risks = risks or []
+    return {
+        "metrics": _compute_metrics(
+            members, feishu_messages, tasks, yesterday_stats, feishu_stats,
+        ),
+        "work": _build_work_summary(members, commit_summaries),
+        "task_changes": _extract_task_changes(tasks),
+        "risks_grouped": _group_risks_by_category(risks),
+    }
+
+
+# ============ 单条 commit 渲染 ============
+
 def _render_one_commit_markdown(c: dict) -> list:
-    """渲染单条 commit（Markdown）。返回行列表。"""
     lines = []
     lines.append(f"#### {c['idx']}. {c['time']} · {c['msg']}")
     lines.append("")
@@ -337,7 +367,6 @@ def _render_one_commit_markdown(c: dict) -> list:
 
 
 def _render_one_commit_html(c: dict, esc) -> str:
-    """渲染单条 commit（HTML）。"""
     parts = []
     parts.append(
         "<div style='border:1px solid #e0e5f5;border-radius:6px;"
@@ -476,51 +505,41 @@ def _render_dual_source_html(final_items, ai_items, source: str) -> str:
 # ============ Markdown 渲染 ============
 
 def _render_markdown(
+    *,
+    model: dict,
     members: list,
     report_date: date,
     team_name: str,
-    feishu_messages: list | None,
-    summary: str | None,
+    feishu_messages: list,
+    summary: str,
     generated_at: datetime,
-    feishu_stats: dict | None = None,
-    yesterday_stats: dict | None = None,
-    highlights: list[str] | None = None,
-    action_items: list[dict] | None = None,
-    commit_summaries: dict[str, str] | None = None,
-    issue_number: int = 0,
-    risks: list[dict] | None = None,
-    problems: list[dict] | None = None,
-    next_plan: list[dict] | None = None,
-    ai_problems: list[dict] | None = None,
-    ai_next_plan: list[dict] | None = None,
-    reflection_source: str = "ai",
-    tasks=None,
+    feishu_stats: dict,
+    yesterday_stats: dict,
+    highlights: list,
+    action_items: list,
+    commit_summaries: dict,
+    issue_number: int,
+    risks: list,
+    problems: list,
+    next_plan: list,
+    ai_problems: list,
+    ai_next_plan: list,
+    reflection_source: str,
 ) -> str:
-    feishu_messages = feishu_messages or []
-    feishu_stats = feishu_stats or {}
-    yesterday_stats = yesterday_stats or {}
-    highlights = highlights or []
-    action_items = action_items or []
-    commit_summaries = commit_summaries or {}
-    risks = risks or []
-    problems = problems or []
-    next_plan = next_plan or []
-    ai_problems = ai_problems or []
-    ai_next_plan = ai_next_plan or []
-    summary = (summary or "").strip()
+    # 从 model 读预算好的数据（不再重算）
+    metrics = model["metrics"]
+    work = model["work"]
+    task_changes = model["task_changes"]
+    risks_grouped = model["risks_grouped"]
+
+    today = metrics["today"]
+    yest = metrics["yesterday"]
 
     weekday_cn = _WEEKDAY_CN[report_date.weekday()]
 
     kept = int(feishu_stats.get("kept", len(feishu_messages)) or 0)
     skipped = int(feishu_stats.get("skipped", 0) or 0)
     total_msgs = int(feishu_stats.get("total", kept + skipped) or 0)
-
-    metrics = _compute_metrics(members, feishu_messages, tasks, yesterday_stats, feishu_stats)
-    today = metrics["today"]
-    yest = metrics["yesterday"]
-
-    task_changes = _extract_task_changes(tasks)
-    risks_grouped = _group_risks_by_category(risks)
 
     lines: list = []
 
@@ -582,7 +601,6 @@ def _render_markdown(
     lines.append("## 工作明细")
     lines.append("")
 
-    work = _build_work_summary(members, commit_summaries)
     if not work["commits"]:
         lines.append("_本日无代码提交记录。_")
         lines.append("")
@@ -714,7 +732,7 @@ def _render_markdown(
     lines.append("---")
     lines.append("")
     lines.append("**数据来源**　GitHub · 飞书开放平台  ")
-    lines.append("**文档版本**　v4.2 · 由智能日报生成器自动生成")
+    lines.append("**文档版本**　v4.3 · 由智能日报生成器自动生成")
 
     return "\n".join(lines)
 
@@ -722,38 +740,35 @@ def _render_markdown(
 # ============ HTML 渲染 ============
 
 def _render_html(
+    *,
+    model: dict,
     members: list,
     report_date: date,
     team_name: str,
-    feishu_messages: list | None,
-    summary: str | None,
+    feishu_messages: list,
+    summary: str,
     generated_at: datetime,
-    feishu_stats: dict | None = None,
-    yesterday_stats: dict | None = None,
-    highlights: list[str] | None = None,
-    action_items: list[dict] | None = None,
-    commit_summaries: dict[str, str] | None = None,
-    issue_number: int = 0,
-    risks: list[dict] | None = None,
-    problems: list[dict] | None = None,
-    next_plan: list[dict] | None = None,
-    ai_problems: list[dict] | None = None,
-    ai_next_plan: list[dict] | None = None,
-    reflection_source: str = "ai",
-    tasks=None,
+    feishu_stats: dict,
+    yesterday_stats: dict,
+    highlights: list,
+    action_items: list,
+    commit_summaries: dict,
+    issue_number: int,
+    risks: list,
+    problems: list,
+    next_plan: list,
+    ai_problems: list,
+    ai_next_plan: list,
+    reflection_source: str,
 ) -> str:
-    feishu_messages = feishu_messages or []
-    feishu_stats = feishu_stats or {}
-    yesterday_stats = yesterday_stats or {}
-    highlights = highlights or []
-    action_items = action_items or []
-    commit_summaries = commit_summaries or {}
-    risks = risks or []
-    problems = problems or []
-    next_plan = next_plan or []
-    ai_problems = ai_problems or []
-    ai_next_plan = ai_next_plan or []
-    summary = (summary or "").strip()
+    # 从 model 读预算好的数据（不再重算）
+    metrics = model["metrics"]
+    work = model["work"]
+    task_changes = model["task_changes"]
+    risks_grouped = model["risks_grouped"]
+
+    today = metrics["today"]
+    yest = metrics["yesterday"]
 
     def esc(s) -> str:
         return _html.escape(str(s or ""))
@@ -763,13 +778,6 @@ def _render_html(
     kept = int(feishu_stats.get("kept", len(feishu_messages)) or 0)
     skipped = int(feishu_stats.get("skipped", 0) or 0)
     total_msgs = int(feishu_stats.get("total", kept + skipped) or 0)
-
-    metrics = _compute_metrics(members, feishu_messages, tasks, yesterday_stats, feishu_stats)
-    today = metrics["today"]
-    yest = metrics["yesterday"]
-
-    task_changes = _extract_task_changes(tasks)
-    risks_grouped = _group_risks_by_category(risks)
 
     h2_style = ("color:#1a237e;border-bottom:2px solid #4a6cf7;padding-bottom:6px;"
                 "margin-top:32px;margin-bottom:16px;font-size:20px;")
@@ -877,7 +885,6 @@ def _render_html(
 
     # 工作明细
     p.append("<h2 style='" + h2_style + "'>工作明细</h2>")
-    work = _build_work_summary(members, commit_summaries)
     if not work["commits"]:
         p.append("<p style='color:#999;'>本日无代码提交记录。</p>")
     else:
@@ -1001,7 +1008,7 @@ def _render_html(
     p.append("<hr style='border:none;border-top:2px solid #e0e5f5;margin:32px 0 20px 0;'>")
     p.append("<div style='color:#999;font-size:12px;line-height:1.9;'>")
     p.append("<b>数据来源</b>　GitHub · 飞书开放平台<br>")
-    p.append("<b>文档版本</b>　v4.2 · 由智能日报生成器自动生成")
+    p.append("<b>文档版本</b>　v4.3 · 由智能日报生成器自动生成")
     p.append("</div>")
 
     p.append("</body></html>")
@@ -1033,20 +1040,56 @@ def generate(
     tasks=None,
 ) -> Report:
     generated_at = generated_at or datetime.now()
-    md = _render_markdown(
-        members, report_date, team_name, feishu_messages,
-        summary, generated_at, feishu_stats, yesterday_stats, highlights,
-        action_items, commit_summaries, issue_number,
-        risks, problems, next_plan, ai_problems, ai_next_plan,
-        reflection_source, tasks,
+
+    # 归一化默认值
+    feishu_messages = feishu_messages or []
+    feishu_stats = feishu_stats or {}
+    yesterday_stats = yesterday_stats or {}
+    highlights = highlights or []
+    action_items = action_items or []
+    commit_summaries = commit_summaries or {}
+    risks = risks or []
+    problems = problems or []
+    next_plan = next_plan or []
+    ai_problems = ai_problems or []
+    ai_next_plan = ai_next_plan or []
+    summary = (summary or "").strip()
+
+    # ⭐ v4.3：一次性构建 model（之前算两遍）
+    model = _build_model(
+        members=members,
+        feishu_messages=feishu_messages,
+        tasks=tasks,
+        yesterday_stats=yesterday_stats,
+        feishu_stats=feishu_stats,
+        commit_summaries=commit_summaries,
+        risks=risks,
     )
-    html = _render_html(
-        members, report_date, team_name, feishu_messages,
-        summary, generated_at, feishu_stats, yesterday_stats, highlights,
-        action_items, commit_summaries, issue_number,
-        risks, problems, next_plan, ai_problems, ai_next_plan,
-        reflection_source, tasks,
+
+    common = dict(
+        model=model,
+        members=members,
+        report_date=report_date,
+        team_name=team_name,
+        feishu_messages=feishu_messages,
+        summary=summary,
+        generated_at=generated_at,
+        feishu_stats=feishu_stats,
+        yesterday_stats=yesterday_stats,
+        highlights=highlights,
+        action_items=action_items,
+        commit_summaries=commit_summaries,
+        issue_number=issue_number,
+        risks=risks,
+        problems=problems,
+        next_plan=next_plan,
+        ai_problems=ai_problems,
+        ai_next_plan=ai_next_plan,
+        reflection_source=reflection_source,
     )
+
+    md = _render_markdown(**common)
+    html = _render_html(**common)
     return Report(
         date=report_date,
         team_name=team_name,

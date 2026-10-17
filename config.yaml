@@ -16,8 +16,8 @@ lark:
   app_id_env: LARK_APP_ID
   app_secret_env: LARK_APP_SECRET
   tasklist_id: ""
-  target_chat_id: oc_90a167bb9750319808b1bf1c3f30d91e
-  notify_chat_id: oc_90a167bb9750319808b1bf1c3f30d91e
+  target_chat_id:  oc_5bde394277bc8d661a8355e060379e95
+  notify_chat_id:  oc_5bde394277bc8d661a8355e060379e95
 
 email:
   smtp_host: smtp.qq.com
@@ -31,8 +31,9 @@ email:
   subject_grade: 研一                    # ← 新增：年级
   subject_name: 刘雨可       
   recipients:
-    - 1730173019@qq.com
-    - 470765757@qq.com
+    #- 1730173019@qq.com
+    #- 470765757@qq.com
+    -  2327929235@qq.com
 
 
 storage:
