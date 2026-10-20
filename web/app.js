@@ -114,10 +114,17 @@
     detailLoading: false,
     runExpanded: {},
     tokenDraft: ReportAPI.getConfigToken(),
+    emails: [],
+    emailLoading: false,
+    emailError: "",
+    emailFilters: { dateFrom: "", dateTo: "" },
+    emailDetail: null,
+    emailTab: "preview",
   };
 
   var ROUTE_TITLES = {
     reports: "日报历史",
+    emails: "发送记录",
     members: "成员映射",
     settings: "采集与推送",
     runs: "管道运行",
@@ -247,6 +254,9 @@
       switch (r.name) {
         case "reports":
           view = r.param ? await pageReportDetail(r.param) : await pageReportsList();
+          break;
+        case "emails":
+          view = r.param ? await pageEmailDetail(r.param) : await pageEmailsList();
           break;
         case "members":
           if (r.param === "new") view = await pageMemberForm(null);
@@ -497,6 +507,7 @@
       '<th class="num">成员</th>' +
       '<th class="num">提交数 / 任务数</th>' +
       "<th>管道结果</th>" +
+      "<th>邮件</th>" +
       "<th>生成时间</th>" +
       '<th class="col-actions">操作</th>' +
       "</tr></thead>";
@@ -521,6 +532,9 @@
           "</span></td>" +
           '<td data-label="管道结果">' +
           reportStatusBadge(r.status) +
+          "</td>" +
+          '<td data-label="邮件">' +
+          (r.email_sent ? badge("已发送", "ok") : badge("未发送", "mute")) +
           "</td>" +
           '<td data-label="生成时间"><span class="num">' +
           esc(fmtDateTime(r.generated_at)) +
@@ -615,6 +629,12 @@
         '<p class="page-head__desc">本页展示管道产出：每位成员的 GitHub 提交记录与飞书任务变更（摘要与统计，不含 diff 源码）。</p>' +
         '<div class="flex-row" style="gap:12px">' +
         reportStatusBadge(report.status) +
+        (report.email_sent
+          ? badge("邮件已发送", "ok") +
+            '<span class="muted" style="font-size:13px">发送时间 ' +
+            esc(fmtDateTime(report.last_sent_at)) +
+            "</span>"
+          : badge("邮件未发送", "mute")) +
         '<span class="muted" style="font-size:13px">生成时间 ' +
         esc(fmtDateTime(report.generated_at)) +
         "</span></div></div>" +
@@ -810,7 +830,202 @@
   }
 
   /* ====================================================================== *
-   * 8. 成员
+   * 8. 发送记录（邮件）
+   * ====================================================================== */
+  function emailTabBtn(id, label, selected) {
+    return (
+      '<button class="tab" role="tab" aria-selected="' +
+      selected +
+      '" data-action="email-tab" data-tab="' +
+      id +
+      '">' +
+      esc(label) +
+      "</button>"
+    );
+  }
+
+  async function loadEmails() {
+    var f = state.emailFilters;
+    if (f.dateFrom && f.dateTo && f.dateFrom > f.dateTo) {
+      state.emailError = "开始日期晚于结束日期";
+      state.emails = [];
+      return;
+    }
+    state.emailError = "";
+    state.emailLoading = true;
+    try {
+      state.emails = await ReportAPI.listEmails(f);
+    } catch (err) {
+      state.emailError = err.message || String(err);
+      state.emails = [];
+    } finally {
+      state.emailLoading = false;
+    }
+  }
+
+  async function pageEmailsList() {
+    if (!state.emails.length && !state.emailError && !state.emailLoading) {
+      await loadEmails();
+    }
+
+    var headActions =
+      '<button class="btn" data-action="emails-refresh">' +
+      icon("refresh") +
+      "刷新列表</button>";
+
+    var body;
+    if (state.emailLoading) body = loadingRows(5);
+    else if (state.emailError)
+      body = errorState(
+        "查询失败",
+        state.emailError,
+        '<button class="btn" data-action="emails-reset">清除筛选</button>'
+      );
+    else body = emailTable();
+
+    return {
+      title: "发送记录",
+      crumb: "SMTP 已发送邮件 · 快照存档",
+      html:
+        '<div class="page stack-6">' +
+        pipelineBanner() +
+        '<div class="page-head">' +
+        '<div class="page-head__main"><h2>发送记录</h2>' +
+        '<p class="page-head__desc">每次通过 SMTP 成功发送的日报邮件都会在此快照存档，可回看当时的主题、收件人与正文内容。</p></div>' +
+        '<div class="page-head__actions">' +
+        headActions +
+        "</div></div>" +
+        '<div class="card">' +
+        '<div class="toolbar" role="search">' +
+        '<div class="field"><label class="field__label" for="ef-from">开始日期</label>' +
+        '<input class="input" type="date" id="ef-from" data-email-filter="dateFrom" value="' +
+        esc(state.emailFilters.dateFrom) +
+        '"/></div>' +
+        '<div class="field"><label class="field__label" for="ef-to">结束日期</label>' +
+        '<input class="input" type="date" id="ef-to" data-email-filter="dateTo" value="' +
+        esc(state.emailFilters.dateTo) +
+        '"/></div>' +
+        '<div class="toolbar__spacer"></div>' +
+        '<button class="btn btn--ghost" data-action="emails-reset">清除筛选</button>' +
+        "</div>" +
+        body +
+        "</div></div>",
+    };
+  }
+
+  function emailTable() {
+    if (!state.emails.length) {
+      return emptyState(
+        "暂无发送记录",
+        "还没有通过邮件推送过日报。在「日报历史」里打开某日报，点击「推送给 Leader」，发送成功后这里会出现记录。"
+      );
+    }
+
+    var rows = state.emails
+      .map(function (e) {
+        return (
+          "<tr>" +
+          '<td data-label="发送时间"><span class="num">' +
+          esc(fmtDateTime(e.sent_at)) +
+          "</span></td>" +
+          '<td data-label="主题">' +
+          esc(e.subject) +
+          "</td>" +
+          '<td data-label="日报日期"><span class="num">' +
+          esc(e.report_date) +
+          "</span></td>" +
+          '<td data-label="收件人">' +
+          esc((e.recipients || []).join(", ") || "—") +
+          "</td>" +
+          '<td data-label="状态">' +
+          (e.status === "sent" ? badge("已发送", "ok") : badge(e.status, "warn")) +
+          "</td>" +
+          '<td class="col-actions" data-label="操作">' +
+          '<button class="row-action" title="查看内容" data-action="open-email" data-id="' +
+          esc(e.id) +
+          '">' +
+          icon("eye", 17) +
+          "</button></td></tr>"
+        );
+      })
+      .join("");
+
+    return (
+      '<div class="table-wrap"><table class="table table--stack"><thead><tr>' +
+      "<th>发送时间</th><th>主题</th><th>日报日期</th><th>收件人</th><th>状态</th>" +
+      '<th class="col-actions">操作</th>' +
+      "</tr></thead><tbody>" +
+      rows +
+      "</tbody></table></div>"
+    );
+  }
+
+  async function pageEmailDetail(id) {
+    var email = await ReportAPI.getEmail(id);
+    state.emailDetail = email;
+
+    var actions =
+      '<a class="btn btn--ghost btn--sm" href="#/emails">' +
+      icon("back", 16) +
+      "返回发送记录</a>" +
+      (email.report_id
+        ? '<a class="btn btn--primary btn--sm" href="#/reports/' +
+          esc(email.report_id) +
+          '">' +
+          icon("eye", 16) +
+          "查看对应日报</a>"
+        : "");
+
+    return {
+      title: "邮件详情",
+      crumb: email.report_date + " · " + (email.subject || "无主题"),
+      html:
+        '<div class="page stack-6">' +
+        '<div class="page-head"><div class="page-head__main">' +
+        '<div class="flex-row" style="gap:8px;align-self:flex-start;margin-bottom:4px">' +
+        actions +
+        "</div>" +
+        "<h2>" +
+        esc(email.subject || "（无主题）") +
+        "</h2>" +
+        '<p class="page-head__desc">发送邮件正文快照 — 主题 / 发件人 / 收件人 / 发送时间。</p>' +
+        '<div class="flex-row" style="gap:12px">' +
+        (email.status === "sent" ? badge("已发送", "ok") : badge(email.status, "warn")) +
+        '<span class="muted" style="font-size:13px">发送时间 ' +
+        esc(fmtDateTime(email.sent_at)) +
+        "</span></div></div></div>" +
+        '<div class="card">' +
+        '<div class="card__body stack-6" style="border-bottom:1px solid var(--border)">' +
+        '<div class="form-grid">' +
+        '<div class="field"><label class="field__label">发件人</label><div class="readonly-note">' +
+        esc(email.from_addr || "—") +
+        "</div></div>" +
+        '<div class="field span-2"><label class="field__label">收件人</label><div class="readonly-note">' +
+        esc((email.recipients || []).join(", ") || "—") +
+        "</div></div>" +
+        "</div></div>" +
+        '<div class="tabs" role="tablist">' +
+        emailTabBtn("preview", "邮件 HTML", state.emailTab === "preview") +
+        emailTabBtn("markdown", "Markdown", state.emailTab === "markdown") +
+        "</div>" +
+        emailPanel(email) +
+        "</div></div>",
+    };
+  }
+
+  function emailPanel(email) {
+    if (state.emailTab === "markdown") {
+      return '<pre class="code-block" aria-label="Markdown 源码">' + esc(email.markdown || "") + "</pre>";
+    }
+    return (
+      '<div class="card__body card__body--flush"><iframe class="preview-frame" title="邮件 HTML 预览" sandbox="" srcdoc="' +
+      esc(email.html || "") +
+      '"></iframe></div>'
+    );
+  }
+
+  /* ====================================================================== *
+   * 9. 成员
    * ====================================================================== */
   async function ensureMembers() {
     var data = await ReportAPI.listMembers();
@@ -1054,7 +1269,7 @@
   }
 
   /* ====================================================================== *
-   * 9. 设置
+   * 10. 设置
    * ====================================================================== */
   async function pageSettings() {
     var s = await ReportAPI.getConfig();
@@ -1335,7 +1550,7 @@
   }
 
   /* ====================================================================== *
-   * 10. 运行记录（由日报历史派生展示）
+   * 11. 运行记录（由日报历史派生展示）
    * ====================================================================== */
   async function pageRuns() {
     if (!state.reports.length) {
@@ -1425,7 +1640,7 @@
   }
 
   /* ====================================================================== *
-   * 11. 操作
+   * 12. 操作
    * ====================================================================== */
   async function doGenerate() {
     toast(
@@ -1477,13 +1692,16 @@
     try {
       var resp = await ReportAPI.sendReport(id);
       toast("ok", "已推送", resp.message || "邮件已发送给配置的收件人");
+      state.reports = [];
+      state.emails = [];
+      routeTo();
     } catch (err) {
       toast("error", "推送失败", err.message || String(err));
     }
   }
 
   /* ====================================================================== *
-   * 12. 事件委托
+   * 13. 事件委托
    * ====================================================================== */
   document.addEventListener("click", function (e) {
     var t = e.target.closest("[data-action]");
@@ -1508,6 +1726,22 @@
           return loadReports().then(routeTo);
         });
         break;
+      case "emails-refresh":
+        state.emails = [];
+        state.emailLoading = true;
+        routeTo().then(function () {
+          return loadEmails().then(routeTo);
+        });
+        break;
+      case "emails-reset":
+        state.emailFilters = { dateFrom: "", dateTo: "" };
+        state.emailError = "";
+        state.emails = [];
+        state.emailLoading = true;
+        routeTo().then(function () {
+          return loadEmails().then(routeTo);
+        });
+        break;
       case "list-sort":
         state.filters.order = state.filters.order === "asc" ? "desc" : "asc";
         routeTo();
@@ -1525,8 +1759,15 @@
       case "open-report":
         navigate("reports/" + t.getAttribute("data-id"));
         break;
+      case "open-email":
+        navigate("emails/" + t.getAttribute("data-id"));
+        break;
       case "detail-tab":
         state.detailTab = t.getAttribute("data-tab");
+        routeTo();
+        break;
+      case "email-tab":
+        state.emailTab = t.getAttribute("data-tab");
         routeTo();
         break;
       case "export-md":
@@ -1598,12 +1839,23 @@
     });
   });
 
+  document.addEventListener("change", function (e) {
+    var el = e.target.closest("[data-email-filter]");
+    if (!el) return;
+    state.emailFilters[el.getAttribute("data-email-filter")] = el.value;
+    state.emails = [];
+    state.emailLoading = true;
+    routeTo().then(function () {
+      return loadEmails().then(routeTo);
+    });
+  });
+
   document.addEventListener("keydown", function (e) {
     if (e.key === "Escape" && document.getElementById("modalRoot").innerHTML) closeModal();
   });
 
   /* ====================================================================== *
-   * 13. 启动
+   * 14. 启动
    * ====================================================================== */
   async function boot() {
     if (!location.hash) location.hash = "#/reports";

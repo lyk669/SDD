@@ -89,3 +89,16 @@ class DailyReport:
     generated_at: datetime
     markdown: str
     html: str
+
+
+@dataclass
+class StoredReport:
+    """SQLite 存档的日报记录（供 API / 工作台查询历史）。"""
+
+    id: int
+    report_date: date
+    team_name: str
+    markdown: str
+    html: str
+    generated_at: datetime
+    payload: dict | None = None

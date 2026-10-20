@@ -232,6 +232,8 @@ class ReportSummary(BaseModel):
     commits_count: int = 0
     tasks_count: int = 0
     status: str = "ok"
+    email_sent: bool = False
+    last_sent_at: str = ""
 
 
 class ReportDetail(ReportSummary):
@@ -239,6 +241,22 @@ class ReportDetail(ReportSummary):
     html: str
     members: list[dict[str, Any]] = Field(default_factory=list)
     sources: dict[str, Any] = Field(default_factory=dict)
+
+
+class EmailLogSummary(BaseModel):
+    id: int
+    report_id: int | None = None
+    report_date: str
+    subject: str
+    recipients: list[str] = Field(default_factory=list)
+    from_addr: str = ""
+    sent_at: str = ""
+    status: str = "sent"
+
+
+class EmailLogDetail(EmailLogSummary):
+    markdown: str
+    html: str
 
 
 class MemberIn(BaseModel):
@@ -339,7 +357,8 @@ def list_reports(
     if date_from and date_to and date_from > date_to:
         raise HTTPException(status_code=400, detail="开始日期晚于结束日期")
 
-    items = _storage().list_recent(limit=limit)
+    storage = _storage()
+    items = storage.list_recent(limit=limit)
     out: list[ReportSummary] = []
     for r in items:
         d = r.report_date.isoformat()
@@ -350,6 +369,7 @@ def list_reports(
         if team and team not in ("", "全部") and r.team_name != team:
             continue
         mc, cc, tc, status = _summarize_markdown(r.markdown)
+        email = storage.latest_email_for_report(r.id)
         out.append(
             ReportSummary(
                 id=r.id,
@@ -360,6 +380,8 @@ def list_reports(
                 commits_count=cc,
                 tasks_count=tc,
                 status=status,
+                email_sent=email is not None,
+                last_sent_at=(email or {}).get("sent_at", ""),
             )
         )
     return out
@@ -368,12 +390,14 @@ def list_reports(
 @app.get("/api/reports/{report_id}", response_model=ReportDetail)
 def get_report(report_id: int) -> ReportDetail:
     """日报详情。"""
-    report = _storage().get_by_id(report_id)
+    storage = _storage()
+    report = storage.get_by_id(report_id)
     if report is None:
         raise HTTPException(status_code=404, detail="日报不存在")
     mc, cc, tc, status = _summarize_markdown(report.markdown)
     members = _parse_members_from_markdown(report.markdown)
     degraded = status == "degraded"
+    email = storage.latest_email_for_report(report.id)
     return ReportDetail(
         id=report.id,
         report_date=report.report_date.isoformat(),
@@ -383,6 +407,8 @@ def get_report(report_id: int) -> ReportDetail:
         commits_count=cc,
         tasks_count=tc,
         status=status,
+        email_sent=email is not None,
+        last_sent_at=(email or {}).get("sent_at", ""),
         markdown=report.markdown,
         html=report.html,
         members=members,
@@ -494,8 +520,9 @@ def generate_report(body: GenerateBody | None = None) -> dict[str, Any]:
 
 @app.post("/api/reports/{report_id}/send")
 def send_report(report_id: int) -> dict[str, Any]:
-    """按已存日报重新发送邮件。"""
-    report = _storage().get_by_id(report_id)
+    """按已存日报重新发送邮件，并把发送内容快照存档。"""
+    storage = _storage()
+    report = storage.get_by_id(report_id)
     if report is None:
         raise HTTPException(status_code=404, detail="日报不存在")
     try:
@@ -515,19 +542,54 @@ def send_report(report_id: int) -> dict[str, Any]:
         html=report.html,
         generated_at=report.generated_at,
     )
+    recipients = cfg.email.get("recipients") or []
+    from_addr = cfg.email.get("from_addr") or user
+    subject = f"{report.team_name} 日报 — {report.report_date.isoformat()}"
     ok = email_notifier.send(
         daily,
-        cfg.email.get("recipients") or [],
+        recipients,
         smtp_host=cfg.email["smtp_host"],
         smtp_port=int(cfg.email.get("smtp_port") or 465),
         use_ssl=bool(cfg.email.get("use_ssl", True)),
         username=user,
         password=password,
-        from_addr=cfg.email.get("from_addr") or user,
+        from_addr=from_addr,
+        subject=subject,
     )
     if not ok:
         raise HTTPException(status_code=500, detail="邮件发送失败")
-    return {"ok": True, "message": "邮件已发送"}
+
+    email_id = storage.save_email_log(
+        report_id=report.id,
+        report_date=report.report_date.isoformat(),
+        subject=subject,
+        recipients=recipients,
+        from_addr=from_addr,
+        markdown=report.markdown,
+        html=report.html,
+    )
+    return {"ok": True, "message": "邮件已发送", "email_id": email_id}
+
+
+@app.get("/api/emails", response_model=list[EmailLogSummary])
+def list_emails(
+    limit: int = Query(100, ge=1, le=500),
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> list[EmailLogSummary]:
+    """已发送邮件记录列表（摘要）。"""
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(status_code=400, detail="开始日期晚于结束日期")
+    return _storage().list_email_logs(limit=limit, date_from=date_from, date_to=date_to)
+
+
+@app.get("/api/emails/{email_id}", response_model=EmailLogDetail)
+def get_email(email_id: int) -> EmailLogDetail:
+    """某条邮件记录详情（含正文快照）。"""
+    email = _storage().get_email_log(email_id)
+    if email is None:
+        raise HTTPException(status_code=404, detail="邮件记录不存在")
+    return EmailLogDetail(**email)
 
 
 # ---------------------------------------------------------------------------

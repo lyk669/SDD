@@ -929,6 +929,18 @@ def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
     except ConfigError as exc:
         logger.error(f"邮件推送跳过: {exc}")
 
+    if email_ok:
+        storage.save_email_log(
+            report_id=report_id,
+            report_date=report.date.isoformat(),
+            subject=subject,
+            recipients=recipients,
+            from_addr=sender or _resolve_sender(cfg),
+            markdown=report.markdown,
+            html=report.html,
+        )
+        logger.info(f"邮件发送记录已存档 report_id={report_id}")
+
     feishu_ok = _send_feishu_with_report(
         cfg, report, members, highlights, summary, subject,
     )

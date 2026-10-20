@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from unittest.mock import MagicMock, patch
-
 from notifier.email import send
 from shared.models import DailyReport, MemberReport
 

@@ -134,5 +134,21 @@
         method: "POST",
       });
     },
+
+    listEmails: function (filters) {
+      filters = filters || {};
+      return request(
+        "/emails" +
+          qs({
+            limit: filters.limit || 100,
+            date_from: filters.dateFrom,
+            date_to: filters.dateTo,
+          })
+      );
+    },
+
+    getEmail: function (id) {
+      return request("/emails/" + encodeURIComponent(id));
+    },
   };
 })(window);
