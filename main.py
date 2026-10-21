@@ -34,6 +34,7 @@ from collector import github_events as github_events_collector
 from collector import lark_task as lark_task_collector
 from generator.formatter import generate
 from generator.summarizer import (
+    compare_with_yesterday,
     extract_action_items,
     extract_highlights,
     generate_next_plan,
@@ -504,6 +505,7 @@ class PipelineOutcome:
     next_plan: list[dict] = field(default_factory=list)
     ai_problems: list[dict] = field(default_factory=list)
     ai_next_plan: list[dict] = field(default_factory=list)
+    comparison: dict[str, Any] | None = None
     reflection_source: str = "ai"
     issue_number: int = 0
     sender: str = ""
@@ -702,8 +704,8 @@ def _run_llm_analysis(
     logger.info(f"[LLM] 第 2 轮完成，耗时 {t2 - t1:.1f}s")
 
     # ---- 轮 3 ----
-    logger.info(f"[LLM] 第 3 轮并行（2 个任务）")
-    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="llm3") as ex:
+    logger.info(f"[LLM] 第 3 轮并行（3 个任务）")
+    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="llm3") as ex:
         f_prob = ex.submit(
             partial(generate_problems, members, feishu_msgs,
                     action_items, risks, yesterday_payload, report_date,
@@ -714,9 +716,14 @@ def _run_llm_analysis(
                     action_items, risks, yesterday_payload, report_date,
                     recent_reflections=recent_reflections, max_items=4)
         )
+        f_comp = ex.submit(
+            partial(compare_with_yesterday, members, summary, highlights,
+                    yesterday_payload, report_date)
+        )
 
         ai_problems = f_prob.result() or []
         ai_next_plan = f_plan.result() or []
+        comparison = f_comp.result()
 
     t3 = _time.time()
     logger.info(f"[LLM] 第 3 轮完成，耗时 {t3 - t2:.1f}s")
@@ -730,6 +737,7 @@ def _run_llm_analysis(
         "risks": risks,
         "ai_problems": ai_problems,
         "ai_next_plan": ai_next_plan,
+        "comparison": comparison,
     }
 
 
@@ -805,6 +813,7 @@ def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
     risks = llm_results["risks"]
     ai_problems = llm_results["ai_problems"]
     ai_next_plan = llm_results["ai_next_plan"]
+    comparison = llm_results.get("comparison")
 
     logger.info(f"AI 草稿：问题 {len(ai_problems)} 条，计划 {len(ai_next_plan)} 条")
 
@@ -865,6 +874,7 @@ def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
         reflection_source=reflection_source,
         tasks=tasks,
         summary=summary,
+        comparison=comparison,
         generated_at=started,
     )
 
@@ -882,6 +892,7 @@ def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
         "ai_next_plan": ai_next_plan,
         "reflection_source": reflection_source,
         "issue_number": issue_number,
+        "comparison": comparison,
         "members": [
             {"name": m.name, "github_username": m.github_username,
              "commits_failed": m.commits_failed, "tasks_failed": m.tasks_failed,
@@ -916,6 +927,7 @@ def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
             commit_summaries=commit_summaries,
             risks=risks, problems=problems, next_plan=next_plan,
             ai_problems=ai_problems, ai_next_plan=ai_next_plan,
+            comparison=comparison,
             reflection_source=reflection_source,
             issue_number=issue_number,
             sender=sender, recipients=recipients,
@@ -959,6 +971,7 @@ def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
         commit_summaries=commit_summaries,
         risks=risks, problems=problems, next_plan=next_plan,
         ai_problems=ai_problems, ai_next_plan=ai_next_plan,
+        comparison=comparison,
         reflection_source=reflection_source,
         issue_number=issue_number,
         sender=sender, recipients=recipients,

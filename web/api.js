@@ -150,5 +150,18 @@
     getEmail: function (id) {
       return request("/emails/" + encodeURIComponent(id));
     },
+
+    getReportAnalysis: function (id) {
+      return request("/reports/" + encodeURIComponent(id) + "/analysis");
+    },
+
+    listReflections: function (opts) {
+      opts = opts || {};
+      return request("/reflections" + qs({ limit: opts.limit || 30 }));
+    },
+
+    getReflection: function (date) {
+      return request("/reflections/" + encodeURIComponent(date));
+    },
   };
 })(window);

@@ -111,6 +111,7 @@
     pageSize: 6,
     detailTab: "members",
     detail: null,
+    detailAnalysis: null,
     detailLoading: false,
     runExpanded: {},
     tokenDraft: ReportAPI.getConfigToken(),
@@ -596,6 +597,14 @@
     }
     state.detail = report;
 
+    var analysis = null;
+    try {
+      analysis = await ReportAPI.getReportAnalysis(report.id);
+    } catch (_) {
+      analysis = null;
+    }
+    state.detailAnalysis = analysis;
+
     var actions =
       '<button class="btn" data-action="report-regenerate" title="重新跑一遍采集→生成管道">' +
       icon("refresh") +
@@ -644,7 +653,9 @@
         '<div class="card">' +
         sourceStrip(report) +
         '<div class="tabs" role="tablist">' +
+        tabBtn("analysis", "分析", state.detailTab === "analysis") +
         tabBtn("members", "按成员查看", state.detailTab === "members") +
+        tabBtn("reflection", "反思", state.detailTab === "reflection") +
         tabBtn("preview", "邮件 HTML", state.detailTab === "preview") +
         tabBtn("markdown", "Markdown", state.detailTab === "markdown") +
         "</div>" +
@@ -691,6 +702,12 @@
   }
 
   function detailPanel(r) {
+    if (state.detailTab === "analysis") {
+      return analysisPanel();
+    }
+    if (state.detailTab === "reflection") {
+      return reflectionPanel();
+    }
     if (state.detailTab === "preview") {
       return (
         '<div class="card__body card__body--flush"><iframe class="preview-frame" title="日报 HTML 预览" sandbox="" srcdoc="' +
@@ -826,6 +843,195 @@
       '</span></span><span class="record__time">' +
       esc(fmtTime(t.updated_at)) +
       "</span></div></div>"
+    );
+  }
+
+  function analysisSection(title, body) {
+    return (
+      '<section><h3 class="member-col__title" style="margin-bottom:8px">' +
+      esc(title) +
+      "</h3>" +
+      body +
+      "</section>"
+    );
+  }
+
+  function actionItemsHtml(items) {
+    var typeCn = { decision: "决策", todo: "待办", issue: "问题" };
+    return (
+      '<div class="stack-4">' +
+      items
+        .map(function (it) {
+          var t = typeCn[it.type] || "其他";
+          var tone = it.type === "decision" ? "ok" : it.type === "todo" ? "info" : "warn";
+          return (
+            '<div class="record"><div class="record__main"><span style="margin-right:8px">' +
+            badge(t, tone) +
+            '</span><span class="record__title">' +
+            esc(it.text) +
+            '</span></div><div class="record__meta"><span>' +
+            esc(it.people || "—") +
+            "</span></div></div>"
+          );
+        })
+        .join("") +
+      "</div>"
+    );
+  }
+
+  function risksHtml(risks) {
+    return (
+      '<div class="stack-4">' +
+      risks
+        .map(function (r) {
+          return (
+            '<div class="record"><div class="record__main"><span class="record__title">' +
+            esc(r.text) +
+            '</span></div><div class="record__meta">' +
+            badge(r.category || "风险", "warn") +
+            "</div></div>"
+          );
+        })
+        .join("") +
+      "</div>"
+    );
+  }
+
+  function analysisPanel() {
+    var a = state.detailAnalysis;
+    if (!a) {
+      return (
+        '<div class="card__body">' +
+        emptyState("暂无分析数据", "该日报没有归档 AI 分析，可能是早期版本或未配置 DEEPSEEK_API_KEY。") +
+        "</div>"
+      );
+    }
+    var blocks = [];
+    if (a.summary) {
+      blocks.push(
+        analysisSection(
+          "一句话结论",
+          '<div class="readonly-note" style="margin:0">' + esc(a.summary).replace(/\n/g, "<br>") + "</div>"
+        )
+      );
+    }
+    var cmp = a.comparison;
+    if (cmp && (cmp.summary || (cmp.changes || []).length || cmp.trend)) {
+      var inner = "";
+      if (cmp.summary) inner += '<p style="margin:0 0 6px">' + esc(cmp.summary) + "</p>";
+      if (cmp.trend) inner += '<div style="margin-bottom:6px">' + badge("趋势：" + cmp.trend, "info") + "</div>";
+      if ((cmp.changes || []).length) {
+        inner +=
+          '<ul style="margin:0;padding-left:18px">' +
+          cmp.changes.map(function (c) {
+            return "<li>" + esc(c) + "</li>";
+          }).join("") +
+          "</ul>";
+      }
+      blocks.push(analysisSection("环比结论", inner));
+    }
+    if ((a.highlights || []).length) {
+      blocks.push(
+        analysisSection(
+          "今日亮点",
+          '<ol style="margin:0;padding-left:20px">' +
+            a.highlights.map(function (h) {
+              return "<li>" + esc(h) + "</li>";
+            }).join("") +
+            "</ol>"
+        )
+      );
+    }
+    if ((a.action_items || []).length) {
+      blocks.push(analysisSection("群讨论要点", actionItemsHtml(a.action_items)));
+    }
+    if ((a.risks || []).length) {
+      blocks.push(analysisSection("风险与待办", risksHtml(a.risks)));
+    }
+    if (!blocks.length) {
+      return (
+        '<div class="card__body">' +
+        emptyState("暂无分析数据", "该日报没有可展示的分析内容。") +
+        "</div>"
+      );
+    }
+    return '<div class="card__body stack-6">' + blocks.join("") + "</div>";
+  }
+
+  function reflectionList(title, finalItems, aiItems, source) {
+    function texts(items) {
+      return (items || [])
+        .map(function (it) {
+          return typeof it === "string" ? it : it.text || "";
+        })
+        .filter(function (t) {
+          return t;
+        });
+    }
+    var finals = texts(finalItems);
+    var ais = texts(aiItems);
+    var body = "";
+    if (finals.length) {
+      body +=
+        '<ol style="margin:0;padding-left:20px">' +
+        finals.map(function (t) {
+          return "<li>" + esc(t) + "</li>";
+        }).join("") +
+        "</ol>";
+    } else {
+      body += '<p class="muted" style="margin:0">（无内容）</p>';
+    }
+    if (source !== "ai" && ais.length) {
+      body +=
+        '<details style="margin-top:8px"><summary style="cursor:pointer;color:#4a6cf7">AI 草稿（点开对比）</summary>' +
+        '<ol style="margin:6px 0 0;padding-left:20px;color:#666">' +
+        ais.map(function (t) {
+          return "<li>" + esc(t) + "</li>";
+        }).join("") +
+        "</ol></details>";
+    }
+    return (
+      '<section><h3 class="member-col__title" style="margin-bottom:8px">' +
+      esc(title) +
+      '<span class="count">' +
+      finals.length +
+      "</span></h3>" +
+      body +
+      "</section>"
+    );
+  }
+
+  function reflectionPanel() {
+    var a = state.detailAnalysis;
+    if (!a) {
+      return (
+        '<div class="card__body">' +
+        emptyState("暂无反思数据", "该日报没有归档问题与思考 / 明日计划。") +
+        "</div>"
+      );
+    }
+    var problems = a.problems || [];
+    var nextPlan = a.next_plan || [];
+    var aiProblems = a.ai_problems || [];
+    var aiNextPlan = a.ai_next_plan || [];
+    if (!problems.length && !nextPlan.length && !aiProblems.length && !aiNextPlan.length) {
+      return (
+        '<div class="card__body">' +
+        emptyState("暂无反思数据", "该日报没有可展示的问题与思考 / 明日计划。") +
+        "</div>"
+      );
+    }
+    var srcLabel = { ai: "AI 草稿", manual: "用户输入", hybrid: "AI + 用户混合" }[a.reflection_source] || "AI 草稿";
+    return (
+      '<div class="card__body stack-6">' +
+      '<div class="notice notice--info" style="margin:0">' +
+      icon("info", 16) +
+      "<span>来源：" +
+      esc(srcLabel) +
+      "。AI 草稿与最终内容并列展示，便于对比。</span></div>" +
+      reflectionList("问题与思考", problems, aiProblems, a.reflection_source) +
+      reflectionList("明日计划", nextPlan, aiNextPlan, a.reflection_source) +
+      "</div>"
     );
   }
 

@@ -461,6 +461,44 @@ class ReportStorage:
             })
         return results
 
+    def list_reflections(self, limit: int = 30) -> list[dict]:
+        """按日期倒序列出反思记录（问题与思考 + 明日计划）。"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT report_date, problems_json, next_plan_json,
+                           ai_problems_json, ai_next_plan_json,
+                           source, created_at
+                    FROM reflections ORDER BY report_date DESC LIMIT ?
+                    """,
+                    (int(limit),),
+                ).fetchall()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"读反思列表失败: {exc}")
+            return []
+
+        def _load(s):
+            if not s:
+                return []
+            try:
+                return json.loads(s)
+            except Exception:  # noqa: BLE001
+                return []
+
+        return [
+            {
+                "report_date": row[0],
+                "problems": _load(row[1]),
+                "next_plan": _load(row[2]),
+                "ai_problems": _load(row[3]),
+                "ai_next_plan": _load(row[4]),
+                "source": row[5] or "ai",
+                "created_at": row[6] or "",
+            }
+            for row in rows
+        ]
+
     # ---------- 邮件发送记录（sent_emails） ----------
 
     @staticmethod

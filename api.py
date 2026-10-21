@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import re
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -427,6 +428,34 @@ def get_report(report_id: int) -> ReportDetail:
     )
 
 
+@app.get("/api/reports/{report_id}/analysis")
+def get_report_analysis(report_id: int) -> dict[str, Any]:
+    """日报的结构化 AI 分析（一句话结论 / 亮点 / 群讨论要点 / 风险 / 反思 / 环比）。"""
+    storage = _storage()
+    report = storage.get_by_id(report_id)
+    if report is None:
+        raise HTTPException(status_code=404, detail="日报不存在")
+    payload = report.payload or {}
+    return {
+        "report_id": report.id,
+        "report_date": report.report_date.isoformat(),
+        "team_name": report.team_name,
+        "issue_number": payload.get("issue_number", 0),
+        "summary": payload.get("summary", ""),
+        "highlights": payload.get("highlights", []),
+        "action_items": payload.get("action_items", []),
+        "risks": payload.get("risks", []),
+        "problems": payload.get("problems", []),
+        "next_plan": payload.get("next_plan", []),
+        "ai_problems": payload.get("ai_problems", []),
+        "ai_next_plan": payload.get("ai_next_plan", []),
+        "reflection_source": payload.get("reflection_source", "ai"),
+        "commit_summaries": payload.get("commit_summaries", {}),
+        "sources": payload.get("sources", {}),
+        "comparison": payload.get("comparison", None),
+    }
+
+
 @app.get("/api/members")
 def list_members() -> dict[str, Any]:
     """成员映射列表（来自 config.yaml）。"""
@@ -590,6 +619,27 @@ def get_email(email_id: int) -> EmailLogDetail:
     if email is None:
         raise HTTPException(status_code=404, detail="邮件记录不存在")
     return EmailLogDetail(**email)
+
+
+@app.get("/api/reflections")
+def list_reflections(
+    limit: int = Query(30, ge=1, le=365),
+) -> list[dict[str, Any]]:
+    """历史反思列表（问题与思考 + 明日计划，按日期倒序）。"""
+    return _storage().list_reflections(limit=limit)
+
+
+@app.get("/api/reflections/{report_date}")
+def get_reflection(report_date: str) -> dict[str, Any]:
+    """某天的反思记录。"""
+    try:
+        target = date.fromisoformat(report_date)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="日期格式应为 YYYY-MM-DD") from exc
+    reflection = _storage().get_reflection_by_date(target)
+    if reflection is None:
+        raise HTTPException(status_code=404, detail="该日期没有反思记录")
+    return reflection
 
 
 # ---------------------------------------------------------------------------

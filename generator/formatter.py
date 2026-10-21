@@ -525,6 +525,7 @@ def _render_markdown(
     ai_problems: list,
     ai_next_plan: list,
     reflection_source: str,
+    comparison: dict | None = None,
 ) -> str:
     # 从 model 读预算好的数据（不再重算）
     metrics = model["metrics"]
@@ -588,6 +589,21 @@ def _render_markdown(
     lines.append(_row("飞书任务", "tasks"))
     lines.append(_row("群消息", "msgs"))
     lines.append("")
+
+    # 环比结论
+    if comparison:
+        cmp_summary = (comparison.get("summary") or "").strip()
+        trend = (comparison.get("trend") or "").strip()
+        changes = [str(c).strip() for c in (comparison.get("changes") or []) if str(c).strip()]
+        if cmp_summary or trend or changes:
+            lines.append("**环比结论**" + (f"（{trend}）" if trend else "") + "：")
+            lines.append("")
+            if cmp_summary:
+                lines.append(cmp_summary)
+                lines.append("")
+            for c in changes:
+                lines.append(f"- {c}")
+            lines.append("")
 
     # 今日亮点
     if highlights:
@@ -760,6 +776,7 @@ def _render_html(
     ai_problems: list,
     ai_next_plan: list,
     reflection_source: str,
+    comparison: dict | None = None,
 ) -> str:
     # 从 model 读预算好的数据（不再重算）
     metrics = model["metrics"]
@@ -874,6 +891,25 @@ def _render_html(
     rows.append(build_metric_row("飞书任务", "tasks"))
     rows.append(build_metric_row("群消息", "msgs"))
     p.append(table(headers, rows, aligns))
+
+    # 环比结论
+    if comparison:
+        cmp_summary = (comparison.get("summary") or "").strip()
+        trend = (comparison.get("trend") or "").strip()
+        changes = [str(c).strip() for c in (comparison.get("changes") or []) if str(c).strip()]
+        if cmp_summary or trend or changes:
+            p.append("<div style='background:#eef2ff;border-left:4px solid #4a6cf7;"
+                     "border-radius:6px;padding:10px 14px;margin:10px 0;'>")
+            head = "环比结论" + (f"（{esc(trend)}）" if trend else "")
+            p.append(f"<p style='margin:0;font-size:13px;color:#3949ab;font-weight:600;'>{head}</p>")
+            if cmp_summary:
+                p.append(f"<p style='margin:6px 0 0 0;color:#333;font-size:13px;'>{esc(cmp_summary)}</p>")
+            if changes:
+                p.append("<ul style='margin:6px 0 0 0;padding-left:18px;font-size:13px;color:#333;'>")
+                for c in changes:
+                    p.append(f"<li style='margin:2px 0;'>{esc(c)}</li>")
+                p.append("</ul>")
+            p.append("</div>")
 
     # 今日亮点
     if highlights:
@@ -1037,6 +1073,7 @@ def generate(
     ai_problems: list[dict] | None = None,
     ai_next_plan: list[dict] | None = None,
     reflection_source: str = "ai",
+    comparison: dict | None = None,
     tasks=None,
 ) -> Report:
     generated_at = generated_at or datetime.now()
@@ -1053,6 +1090,7 @@ def generate(
     next_plan = next_plan or []
     ai_problems = ai_problems or []
     ai_next_plan = ai_next_plan or []
+    comparison = comparison or None
     summary = (summary or "").strip()
 
     # ⭐ v4.3：一次性构建 model（之前算两遍）
@@ -1086,6 +1124,7 @@ def generate(
         ai_problems=ai_problems,
         ai_next_plan=ai_next_plan,
         reflection_source=reflection_source,
+        comparison=comparison,
     )
 
     md = _render_markdown(**common)
