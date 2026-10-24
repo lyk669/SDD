@@ -2,7 +2,7 @@
 
 包含：
   - daily_reports 表：日报主数据
-  - reflections 表：问题与思考 + 明日计划（含 AI 草稿 / 用户输入标记）
+  - reflections 表：明日计划（含 AI 草稿 / 用户输入标记）
 """
 
 from __future__ import annotations
@@ -46,15 +46,13 @@ class ReportStorage:
                 "CREATE INDEX IF NOT EXISTS idx_report_date ON daily_reports(report_date)"
             )
 
-            # 反思表（问题与思考 + 明日计划）
+            # 反思表（明日计划）
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS reflections (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     report_date TEXT NOT NULL UNIQUE,
-                    problems_json TEXT,
                     next_plan_json TEXT,
-                    ai_problems_json TEXT,
                     ai_next_plan_json TEXT,
                     source TEXT,
                     created_at TEXT NOT NULL
@@ -320,25 +318,21 @@ class ReportStorage:
             "payload": json.loads(row[6]) if row[6] else None,
         }
 
-    # ---------- 反思表（问题与思考 + 明日计划） ----------
+    # ---------- 反思表（明日计划） ----------
 
     def save_reflection(
         self,
         report_date: date,
-        problems: list[dict] | None,
         next_plan: list[dict] | None,
-        ai_problems: list[dict] | None = None,
         ai_next_plan: list[dict] | None = None,
         source: str = "ai",
     ) -> None:
-        """保存当天的反思。同一天覆盖。
+        """保存当天的计划。同一天覆盖。
 
         Args:
-            problems: 最终版的问题（用户输入 or AI 草稿）
             next_plan: 最终版的计划
-            ai_problems: AI 原始草稿（保留供对比）
             ai_next_plan: AI 原始计划
-            source: "ai" / "manual" / "hybrid"
+            source: "ai" / "manual"
         """
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
@@ -348,32 +342,28 @@ class ReportStorage:
             conn.execute(
                 """
                 INSERT INTO reflections
-                    (report_date, problems_json, next_plan_json,
-                     ai_problems_json, ai_next_plan_json,
+                    (report_date, next_plan_json, ai_next_plan_json,
                      source, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?)
                 """,
                 (
                     report_date.isoformat(),
-                    json.dumps(problems or [], ensure_ascii=False),
                     json.dumps(next_plan or [], ensure_ascii=False),
-                    json.dumps(ai_problems or [], ensure_ascii=False),
                     json.dumps(ai_next_plan or [], ensure_ascii=False),
                     source,
                     datetime.now().isoformat(),
                 ),
             )
             conn.commit()
-        logger.info(f"反思已保存: {report_date} source={source}")
+        logger.info(f"计划已保存: {report_date} source={source}")
 
     def get_reflection_by_date(self, target_date: date) -> dict | None:
-        """读某天的反思。"""
+        """读某天的计划。"""
         try:
             with sqlite3.connect(self.db_path) as conn:
                 row = conn.execute(
                     """
-                    SELECT problems_json, next_plan_json,
-                           ai_problems_json, ai_next_plan_json,
+                    SELECT next_plan_json, ai_next_plan_json,
                            source, created_at
                     FROM reflections
                     WHERE report_date = ?
@@ -381,7 +371,7 @@ class ReportStorage:
                     (target_date.isoformat(),),
                 ).fetchone()
         except Exception as exc:  # noqa: BLE001
-            logger.warning(f"读取反思失败: {exc}")
+            logger.warning(f"读取计划失败: {exc}")
             return None
 
         if not row:
@@ -397,12 +387,10 @@ class ReportStorage:
 
         return {
             "report_date": target_date.isoformat(),
-            "problems": _load(row[0]),
-            "next_plan": _load(row[1]),
-            "ai_problems": _load(row[2]),
-            "ai_next_plan": _load(row[3]),
-            "source": row[4] or "ai",
-            "created_at": row[5] or "",
+            "next_plan": _load(row[0]),
+            "ai_next_plan": _load(row[1]),
+            "source": row[2] or "ai",
+            "created_at": row[3] or "",
         }
 
     def get_recent_reflections(
@@ -411,7 +399,7 @@ class ReportStorage:
         end_date: date | None = None,
         only_user_written: bool = True,
     ) -> list[dict]:
-        """读最近 N 天的反思，按日期升序。
+        """读最近 N 天的计划，按日期升序。
 
         Args:
             only_user_written: True 表示只返回 source 为 manual/hybrid 的
@@ -424,8 +412,7 @@ class ReportStorage:
             with sqlite3.connect(self.db_path) as conn:
                 rows = conn.execute(
                     """
-                    SELECT report_date, problems_json, next_plan_json,
-                           ai_problems_json, ai_next_plan_json,
+                    SELECT report_date, next_plan_json, ai_next_plan_json,
                            source, created_at
                     FROM reflections
                     WHERE report_date >= ? AND report_date <= ?
@@ -434,7 +421,7 @@ class ReportStorage:
                     (start_date.isoformat(), end_date.isoformat()),
                 ).fetchall()
         except Exception as exc:  # noqa: BLE001
-            logger.warning(f"读最近反思失败: {exc}")
+            logger.warning(f"读最近计划失败: {exc}")
             return []
 
         def _load(s):
@@ -447,35 +434,32 @@ class ReportStorage:
 
         results = []
         for row in rows:
-            source = row[5] or "ai"
+            source = row[3] or "ai"
             if only_user_written and source not in {"manual", "hybrid"}:
                 continue
             results.append({
                 "report_date": row[0],
-                "problems": _load(row[1]),
-                "next_plan": _load(row[2]),
-                "ai_problems": _load(row[3]),
-                "ai_next_plan": _load(row[4]),
+                "next_plan": _load(row[1]),
+                "ai_next_plan": _load(row[2]),
                 "source": source,
-                "created_at": row[6] or "",
+                "created_at": row[4] or "",
             })
         return results
 
     def list_reflections(self, limit: int = 30) -> list[dict]:
-        """按日期倒序列出反思记录（问题与思考 + 明日计划）。"""
+        """按日期倒序列出计划记录（明日计划）。"""
         try:
             with sqlite3.connect(self.db_path) as conn:
                 rows = conn.execute(
                     """
-                    SELECT report_date, problems_json, next_plan_json,
-                           ai_problems_json, ai_next_plan_json,
+                    SELECT report_date, next_plan_json, ai_next_plan_json,
                            source, created_at
                     FROM reflections ORDER BY report_date DESC LIMIT ?
                     """,
                     (int(limit),),
                 ).fetchall()
         except Exception as exc:  # noqa: BLE001
-            logger.warning(f"读反思列表失败: {exc}")
+            logger.warning(f"读计划列表失败: {exc}")
             return []
 
         def _load(s):
@@ -489,12 +473,10 @@ class ReportStorage:
         return [
             {
                 "report_date": row[0],
-                "problems": _load(row[1]),
-                "next_plan": _load(row[2]),
-                "ai_problems": _load(row[3]),
-                "ai_next_plan": _load(row[4]),
-                "source": row[5] or "ai",
-                "created_at": row[6] or "",
+                "next_plan": _load(row[1]),
+                "ai_next_plan": _load(row[2]),
+                "source": row[3] or "ai",
+                "created_at": row[4] or "",
             }
             for row in rows
         ]

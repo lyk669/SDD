@@ -7,8 +7,7 @@
   4. summarize_commits       commit diff 摘要（batch + 并行）
   5. compare_with_yesterday  相比昨天变化分析
   6. generate_risks          风险与待办
-  7. generate_problems       问题与思考（参考历史风格）
-  8. generate_next_plan      明日计划（参考历史风格）
+  7. generate_next_plan      明日计划（参考历史风格）
 
 commit 分类统一由 generator/classify.py 提供。
 """
@@ -163,22 +162,17 @@ def _build_prompt(members, feishu_messages, report_date) -> str:
     return "\n".join(lines)
 
 
-def _format_history_reflections(reflections: list, max_days: int = 7) -> str:
+def _format_history_plans(reflections: list, max_days: int = 7) -> str:
     if not reflections:
         return ""
     items = []
     for r in reflections[-max_days:]:
         date_str = r.get("report_date", "")
-        problems = r.get("problems") or []
         next_plan = r.get("next_plan") or []
-        p_texts = [p.get("text", "") if isinstance(p, dict) else str(p)
-                   for p in problems]
         n_texts = [p.get("text", "") if isinstance(p, dict) else str(p)
                    for p in next_plan]
-        if p_texts or n_texts:
+        if n_texts:
             block = [f"- {date_str}"]
-            for t in p_texts[:3]:
-                block.append(f"  · 问题：{t}")
             for t in n_texts[:3]:
                 block.append(f"  · 计划：{t}")
             items.append("\n".join(block))
@@ -743,115 +737,7 @@ def generate_risks(
     return unique[:5]
 
 
-# ============ 7. 问题与思考 ============
-
-def generate_problems(
-    members,
-    feishu_messages,
-    action_items: list[dict],
-    risks: list[dict],
-    yesterday_payload: dict | None,
-    report_date,
-    *,
-    recent_reflections: list[dict] | None = None,
-    max_items: int = 5,
-) -> list[dict]:
-    api_key = os.environ.get(_API_KEY_ENV, "").strip()
-    if not api_key:
-        return []
-
-    all_commits = [c for m in members for c in (getattr(m, "commits", None) or [])]
-    if not all_commits and not feishu_messages and not risks:
-        return []
-
-    lines = []
-    lines.append(f"日期：{report_date.isoformat()}")
-    lines.append("")
-
-    lines.append("【今日代码提交】")
-    for c in all_commits:
-        msg = (getattr(c, "message", "") or "").split("\n")[0].strip()
-        files_n = int(getattr(c, "files_changed", 0) or 0)
-        add = int(getattr(c, "additions", 0) or 0)
-        dele = int(getattr(c, "deletions", 0) or 0)
-        lines.append(f"- {msg}（{files_n} 个文件，+{add}/-{dele}）")
-    lines.append("")
-
-    if feishu_messages:
-        lines.append("【今日群消息】")
-        for msg in feishu_messages[:10]:
-            sender = getattr(msg, "sender_name", "") or "未知"
-            text = (getattr(msg, "text", "") or "").strip()
-            lines.append(f"- {sender}：{text}")
-        lines.append("")
-
-    if action_items:
-        lines.append("【群讨论要点】")
-        for item in action_items:
-            lines.append(f"- [{item.get('type', '')}] {item.get('text', '')}")
-        lines.append("")
-
-    if risks:
-        lines.append("【已识别的风险】")
-        for r in risks:
-            lines.append(f"- [{r.get('category', '')}] {r.get('text', '')}")
-        lines.append("")
-
-    if yesterday_payload:
-        y_summary = yesterday_payload.get("summary", "")
-        if y_summary:
-            lines.append(f"【昨日结论】{y_summary}")
-            lines.append("")
-
-    history = _format_history_reflections(recent_reflections or [], max_days=7)
-    if history:
-        lines.append("【近 7 天用户真实反思（风格参考，不是今天的内容）】")
-        lines.append(history)
-        lines.append("")
-        lines.append(
-            "请模仿上述用户反思的写法风格（用词习惯、思考角度、"
-            "喜欢说什么、不喜欢说什么），但内容必须是针对今天的情况。"
-        )
-        lines.append("")
-
-    instruction = (
-        f"请根据以上信息，生成今天 3-5 条『问题与思考』。"
-        "要求："
-        "① 严格输出 JSON 数组，格式："
-        '[{"text": "...", "tag": "推测"}]'
-        "；"
-        "② 每条 30-80 字，说清楚『遇到了什么问题』或『有什么反思』；"
-        "③ 语气：像写给自己的工作笔记，不要空话、不要口号；"
-        "④ 所有句子以中文句号『。』结尾；"
-        "⑤ 优先从以下角度思考："
-        "『今天哪里卡住了』『哪个决定做错了』『哪个技术点值得深挖』"
-        "『数据质量哪里出了问题』；"
-        "⑥ 不要 emoji，只输出 JSON。"
-    )
-
-    content = _call_llm(
-        "\n".join(lines) + instruction,
-        system="你是一个专业的技术人员，擅长写反思笔记，风格务实、不空话。",
-        max_tokens=800,
-    )
-    arr = _parse_json(content or "", "array")
-    if not isinstance(arr, list):
-        return []
-
-    result = []
-    for item in arr:
-        if isinstance(item, dict):
-            text = str(item.get("text", "")).strip()
-            if text:
-                result.append({"text": text, "tag": "推测"})
-        elif isinstance(item, str) and item.strip():
-            result.append({"text": item.strip(), "tag": "推测"})
-
-    logger.info(f"问题与思考生成成功（{len(result)} 条）")
-    return result[:max_items]
-
-
-# ============ 8. 明日计划 ============
+# ============ 7. 明日计划 ============
 
 def generate_next_plan(
     members,
@@ -900,7 +786,7 @@ def generate_next_plan(
             lines.append(f"【昨日结论】{y_summary}")
             lines.append("")
 
-    history = _format_history_reflections(recent_reflections or [], max_days=7)
+    history = _format_history_plans(recent_reflections or [], max_days=7)
     if history:
         lines.append("【近 7 天用户真实计划（风格参考）】")
         lines.append(history)

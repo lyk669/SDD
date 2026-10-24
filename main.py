@@ -8,7 +8,6 @@
   python main.py --github-only      # 只采集 GitHub
 
 用户输入（覆盖 AI 草稿）:
-  --reflect "..."     今日反思
   --plan "..."        明日计划
   --interactive       交互式输入
   manual_input.md     本地文件（自动读）
@@ -38,7 +37,6 @@ from generator.summarizer import (
     extract_action_items,
     extract_highlights,
     generate_next_plan,
-    generate_problems,
     generate_risks,
     summarize,
     summarize_commits,
@@ -97,12 +95,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="一键自动：采集全部数据源，生成并发送")
     parser.add_argument("--to", action="append", default=None,
                         help="临时指定收件人邮箱，可重复")
-    parser.add_argument("--reflect", default=None,
-                        help="今日反思（多行用 \\n 分隔），覆盖 AI 草稿")
     parser.add_argument("--plan", default=None,
                         help="明日计划（多行用 \\n 分隔），覆盖 AI 草稿")
     parser.add_argument("--interactive", action="store_true",
-                        help="交互式输入反思与计划")
+                        help="交互式输入明日计划")
     parser.add_argument("--manual-file", default=DEFAULT_MANUAL_FILE,
                         help="手动输入文件路径（默认 manual_input.md）")
     return parser.parse_args(argv)
@@ -180,22 +176,18 @@ def _parse_manual_file(path: str, today: date) -> dict | None:
         elif cur_key is not None:
             sections[cur_key].append(line)
 
-    reflect_lines: list[str] = []
     plan_lines: list[str] = []
     for title, body in sections.items():
         t = title.lower()
         text = "\n".join(body)
-        if "反思" in title or "问题" in title or "reflect" in t:
-            reflect_lines.extend(_parse_multiline_text(text))
-        elif "计划" in title or "明日" in title or "plan" in t:
+        if "计划" in title or "明日" in title or "plan" in t:
             plan_lines.extend(_parse_multiline_text(text))
 
-    if not reflect_lines and not plan_lines:
+    if not plan_lines:
         return None
 
     return {
         "date": today.isoformat(),
-        "reflect": reflect_lines,
         "plan": plan_lines,
     }
 
@@ -220,31 +212,28 @@ def _prompt_multiline(title: str) -> list[str]:
 
 
 def _collect_user_input(args, today: date) -> dict:
-    cli_reflect = _parse_multiline_text(args.reflect or "")
     cli_plan = _parse_multiline_text(args.plan or "")
-    if cli_reflect or cli_plan:
-        logger.info(f"使用命令行输入：反思 {len(cli_reflect)} 条，计划 {len(cli_plan)} 条")
-        return {"reflect": cli_reflect, "plan": cli_plan, "source": "cli"}
+    if cli_plan:
+        logger.info(f"使用命令行输入：计划 {len(cli_plan)} 条")
+        return {"plan": cli_plan, "source": "cli"}
 
     if args.interactive:
-        r = _prompt_multiline("今日反思（问题与思考）")
         p = _prompt_multiline("明日计划")
-        if r or p:
-            logger.info(f"使用交互式输入：反思 {len(r)} 条，计划 {len(p)} 条")
-            return {"reflect": r, "plan": p, "source": "interactive"}
+        if p:
+            logger.info(f"使用交互式输入：计划 {len(p)} 条")
+            return {"plan": p, "source": "interactive"}
 
     file_data = _parse_manual_file(args.manual_file, today)
     if file_data:
-        r = file_data.get("reflect") or []
         p = file_data.get("plan") or []
-        if r or p:
-            logger.info(f"使用文件输入（{args.manual_file}）：反思 {len(r)} 条，计划 {len(p)} 条")
-            return {"reflect": r, "plan": p, "source": "file"}
+        if p:
+            logger.info(f"使用文件输入（{args.manual_file}）：计划 {len(p)} 条")
+            return {"plan": p, "source": "file"}
 
-    return {"reflect": [], "plan": [], "source": "none"}
+    return {"plan": [], "source": "none"}
 
 
-def _to_problems_list(texts: list[str], tag: str) -> list[dict]:
+def _to_items_list(texts: list[str], tag: str) -> list[dict]:
     return [{"text": t, "tag": tag} for t in texts if t and t.strip()]
 
 
@@ -501,9 +490,7 @@ class PipelineOutcome:
     action_items: list[dict] = field(default_factory=list)
     commit_summaries: dict[str, str] = field(default_factory=dict)
     risks: list[dict] = field(default_factory=list)
-    problems: list[dict] = field(default_factory=list)
     next_plan: list[dict] = field(default_factory=list)
-    ai_problems: list[dict] = field(default_factory=list)
     ai_next_plan: list[dict] = field(default_factory=list)
     comparison: dict[str, Any] | None = None
     reflection_source: str = "ai"
@@ -663,7 +650,7 @@ def _run_llm_analysis(
     3 轮并行：
       轮 1（互不依赖）: commit_summaries + action_items
       轮 2（依赖 commit_summaries）: summary + highlights + risks
-      轮 3（依赖 action_items+risks）: ai_problems + ai_next_plan
+      轮 3（依赖 action_items+risks）: ai_next_plan + comparison
     """
     t0 = _time.time()
 
@@ -704,13 +691,8 @@ def _run_llm_analysis(
     logger.info(f"[LLM] 第 2 轮完成，耗时 {t2 - t1:.1f}s")
 
     # ---- 轮 3 ----
-    logger.info(f"[LLM] 第 3 轮并行（3 个任务）")
-    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="llm3") as ex:
-        f_prob = ex.submit(
-            partial(generate_problems, members, feishu_msgs,
-                    action_items, risks, yesterday_payload, report_date,
-                    recent_reflections=recent_reflections, max_items=5)
-        )
+    logger.info(f"[LLM] 第 3 轮并行（2 个任务）")
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="llm3") as ex:
         f_plan = ex.submit(
             partial(generate_next_plan, members, feishu_msgs,
                     action_items, risks, yesterday_payload, report_date,
@@ -721,7 +703,6 @@ def _run_llm_analysis(
                     yesterday_payload, report_date)
         )
 
-        ai_problems = f_prob.result() or []
         ai_next_plan = f_plan.result() or []
         comparison = f_comp.result()
 
@@ -735,7 +716,6 @@ def _run_llm_analysis(
         "summary": summary,
         "highlights": highlights,
         "risks": risks,
-        "ai_problems": ai_problems,
         "ai_next_plan": ai_next_plan,
         "comparison": comparison,
     }
@@ -794,11 +774,11 @@ def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
         issue_number = 0
     logger.info(f"日报期数: 第 {issue_number} 期" if issue_number else "未取到期数")
 
-    # 读近 7 天反思
+    # 读近 7 天计划
     recent_reflections = storage.get_recent_reflections(
         days=7, end_date=until.date(), only_user_written=True,
     )
-    logger.info(f"近 7 天用户真实反思: {len(recent_reflections)} 天")
+    logger.info(f"近 7 天用户真实计划: {len(recent_reflections)} 天")
 
     # ====== LLM 分析（3 轮并行）======
     llm_results = _run_llm_analysis(
@@ -811,50 +791,35 @@ def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
     action_items = llm_results["action_items"]
     commit_summaries = llm_results["commit_summaries"]
     risks = llm_results["risks"]
-    ai_problems = llm_results["ai_problems"]
     ai_next_plan = llm_results["ai_next_plan"]
     comparison = llm_results.get("comparison")
 
-    logger.info(f"AI 草稿：问题 {len(ai_problems)} 条，计划 {len(ai_next_plan)} 条")
+    logger.info(f"AI 草稿：计划 {len(ai_next_plan)} 条")
 
     # ====== 用户输入覆盖 ======
     if user_input is None:
-        user_input = {"reflect": [], "plan": [], "source": "none"}
+        user_input = {"plan": [], "source": "none"}
 
-    user_reflect = user_input.get("reflect") or []
     user_plan = user_input.get("plan") or []
 
-    if user_reflect:
-        problems = _to_problems_list(user_reflect, "用户输入")
-        logger.info(f"用户输入覆盖问题（{len(problems)} 条）")
-    else:
-        problems = ai_problems
-
     if user_plan:
-        next_plan = _to_problems_list(user_plan, "用户输入")
+        next_plan = _to_items_list(user_plan, "用户输入")
         logger.info(f"用户输入覆盖计划（{len(next_plan)} 条）")
+        reflection_source = "manual"
     else:
         next_plan = ai_next_plan
-
-    if user_reflect and user_plan:
-        reflection_source = "manual"
-    elif user_reflect or user_plan:
-        reflection_source = "hybrid"
-    else:
         reflection_source = "ai"
 
-    # ====== 存反思到 SQLite ======
+    # ====== 存计划到 SQLite ======
     try:
         storage.save_reflection(
             report_date=until.date(),
-            problems=problems,
             next_plan=next_plan,
-            ai_problems=ai_problems,
             ai_next_plan=ai_next_plan,
             source=reflection_source,
         )
     except Exception as exc:  # noqa: BLE001
-        logger.warning(f"保存反思失败: {exc}")
+        logger.warning(f"保存计划失败: {exc}")
 
     # ====== 生成日报 ======
     report = generate(
@@ -867,9 +832,7 @@ def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
         commit_summaries=commit_summaries,
         issue_number=issue_number,
         risks=risks,
-        problems=problems,
         next_plan=next_plan,
-        ai_problems=ai_problems,
         ai_next_plan=ai_next_plan,
         reflection_source=reflection_source,
         tasks=tasks,
@@ -886,9 +849,7 @@ def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
         "action_items": action_items,
         "commit_summaries": commit_summaries,
         "risks": risks,
-        "problems": problems,
         "next_plan": next_plan,
-        "ai_problems": ai_problems,
         "ai_next_plan": ai_next_plan,
         "reflection_source": reflection_source,
         "issue_number": issue_number,
@@ -916,7 +877,7 @@ def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
         logger.info("dry-run 模式，跳过推送")
         logger.info(f"邮件主题: {subject}")
         logger.info(f"收件人: {recipients}")
-        logger.info(f"反思来源: {reflection_source}")
+        logger.info(f"计划来源: {reflection_source}")
         logger.info(f"日报任务结束: {(datetime.now(LOCAL_TZ) - started)}")
         return PipelineOutcome(
             code=0, report_id=report_id,
@@ -925,8 +886,8 @@ def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
             feishu_msgs=feishu_msgs_info, summary=summary,
             highlights=highlights, action_items=action_items,
             commit_summaries=commit_summaries,
-            risks=risks, problems=problems, next_plan=next_plan,
-            ai_problems=ai_problems, ai_next_plan=ai_next_plan,
+            risks=risks, next_plan=next_plan,
+            ai_next_plan=ai_next_plan,
             comparison=comparison,
             reflection_source=reflection_source,
             issue_number=issue_number,
@@ -969,8 +930,8 @@ def execute_pipeline(cfg, *, dry_run=False, force=False, lookback_days=1,
         feishu_msgs=feishu_msgs_info, summary=summary,
         highlights=highlights, action_items=action_items,
         commit_summaries=commit_summaries,
-        risks=risks, problems=problems, next_plan=next_plan,
-        ai_problems=ai_problems, ai_next_plan=ai_next_plan,
+        risks=risks, next_plan=next_plan,
+        ai_next_plan=ai_next_plan,
         comparison=comparison,
         reflection_source=reflection_source,
         issue_number=issue_number,

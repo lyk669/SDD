@@ -297,39 +297,6 @@ class TestFormatterMarkdown:
         assert "## 一句话结论" in report.markdown
         assert "今日完成日报系统重构。" in report.markdown
 
-    def test_问题与思考_ai源(self, sample_member):
-        """source=ai 时不应有 <details> 折叠。"""
-        report = generate(
-            members=[sample_member],
-            report_date=date(2026, 10, 15),
-            team_name="Dev Team",
-            problems=[{"text": "AI 草稿问题 1", "tag": "推测"}],
-            ai_problems=[{"text": "AI 草稿问题 1", "tag": "推测"}],
-            reflection_source="ai",
-            generated_at=datetime(2026, 10, 15, 20, 0),
-        )
-        assert "## 问题与思考" in report.markdown
-        assert "来源：AI 草稿" in report.markdown
-        # ai 源不应有折叠
-        qi_section = report.markdown.split("## 问题与思考")[1]
-        assert "<details>" not in qi_section.split("##")[0]
-
-    def test_问题与思考_manual源有折叠(self, sample_member):
-        """source=manual 时应把 AI 草稿折叠起来。"""
-        report = generate(
-            members=[sample_member],
-            report_date=date(2026, 10, 15),
-            team_name="Dev Team",
-            problems=[{"text": "用户写的问题", "tag": "用户输入"}],
-            ai_problems=[{"text": "AI 草稿问题", "tag": "推测"}],
-            reflection_source="manual",
-            generated_at=datetime(2026, 10, 15, 20, 0),
-        )
-        assert "## 问题与思考" in report.markdown
-        assert "来源：用户输入" in report.markdown
-        assert "<details>" in report.markdown
-        assert "AI 草稿" in report.markdown
-
     def test_明日计划(self, sample_member):
         report = generate(
             members=[sample_member],
@@ -424,8 +391,8 @@ class TestFormatterHtml:
             members=[sample_member],
             report_date=date(2026, 10, 15),
             team_name="Dev Team",
-            problems=[{"text": "<script>alert(1)</script>", "tag": "用户输入"}],
-            ai_problems=[],
+            next_plan=[{"text": "<script>alert(1)</script>", "tag": "用户输入"}],
+            ai_next_plan=[],
             reflection_source="manual",
             generated_at=datetime(2026, 10, 15, 20, 0),
         )
@@ -523,28 +490,25 @@ class TestStorage:
     def test_save_and_get_reflection(self, tmp_storage):
         tmp_storage.save_reflection(
             report_date=date(2026, 10, 15),
-            problems=[{"text": "用户问题", "tag": "用户输入"}],
             next_plan=[{"text": "用户计划", "tag": "用户输入"}],
-            ai_problems=[{"text": "AI 问题", "tag": "推测"}],
             ai_next_plan=[{"text": "AI 计划", "tag": "推测"}],
             source="manual",
         )
         r = tmp_storage.get_reflection_by_date(date(2026, 10, 15))
         assert r is not None
         assert r["source"] == "manual"
-        assert len(r["problems"]) == 1
-        assert r["problems"][0]["text"] == "用户问题"
+        assert len(r["next_plan"]) == 1
+        assert r["next_plan"][0]["text"] == "用户计划"
 
     def test_get_recent_reflections_only_user(self, tmp_storage):
         # 一条 AI 源，一条 manual 源
         tmp_storage.save_reflection(
             date(2026, 10, 14),
-            problems=[], next_plan=[], source="ai",
+            next_plan=[], source="ai",
         )
         tmp_storage.save_reflection(
             date(2026, 10, 15),
-            problems=[{"text": "用户写的", "tag": "用户输入"}],
-            next_plan=[],
+            next_plan=[{"text": "用户写的", "tag": "用户输入"}],
             source="manual",
         )
         results = tmp_storage.get_recent_reflections(

@@ -430,7 +430,7 @@ def get_report(report_id: int) -> ReportDetail:
 
 @app.get("/api/reports/{report_id}/analysis")
 def get_report_analysis(report_id: int) -> dict[str, Any]:
-    """日报的结构化 AI 分析（一句话结论 / 亮点 / 群讨论要点 / 风险 / 反思 / 环比）。"""
+    """日报的结构化 AI 分析（一句话结论 / 亮点 / 群讨论要点 / 风险 / 明日计划 / 环比）。"""
     storage = _storage()
     report = storage.get_by_id(report_id)
     if report is None:
@@ -445,9 +445,7 @@ def get_report_analysis(report_id: int) -> dict[str, Any]:
         "highlights": payload.get("highlights", []),
         "action_items": payload.get("action_items", []),
         "risks": payload.get("risks", []),
-        "problems": payload.get("problems", []),
         "next_plan": payload.get("next_plan", []),
-        "ai_problems": payload.get("ai_problems", []),
         "ai_next_plan": payload.get("ai_next_plan", []),
         "reflection_source": payload.get("reflection_source", "ai"),
         "commit_summaries": payload.get("commit_summaries", {}),
@@ -528,22 +526,31 @@ def put_config(
 
 @app.post("/api/generate")
 def generate_report(body: GenerateBody | None = None) -> dict[str, Any]:
-    """触发日报管道（默认 dry-run + force）。"""
+    """触发日报管道（默认 dry-run + force；dry_run=False 时生成后自动发送邮件与飞书群）。"""
     body = body or GenerateBody()
     try:
         cfg = load_config(CONFIG_PATH)
     except ConfigError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    from main import run_pipeline
+    from main import execute_pipeline
 
-    code = run_pipeline(cfg, dry_run=body.dry_run, force=body.force)
-    if code != 0:
-        raise HTTPException(status_code=500, detail="日报生成失败，请查看服务端日志")
+    outcome = execute_pipeline(
+        cfg,
+        dry_run=body.dry_run,
+        force=body.force,
+        lookback_days=body.lookback_days,
+    )
+    # 日报仍可能已写入 SQLite，只有「完全没生成」才按失败处理
+    if outcome.code != 0 and outcome.report_id is None:
+        raise HTTPException(status_code=500, detail=outcome.message or "日报生成失败，请查看服务端日志")
     return {
         "ok": True,
-        "message": "日报已生成" + ("（dry-run，未发信）" if body.dry_run else ""),
+        "report_id": outcome.report_id,
+        "message": outcome.message,
         "dry_run": body.dry_run,
+        "email_sent": outcome.email_sent,
+        "feishu_sent": outcome.feishu_sent,
     }
 
 
@@ -625,13 +632,13 @@ def get_email(email_id: int) -> EmailLogDetail:
 def list_reflections(
     limit: int = Query(30, ge=1, le=365),
 ) -> list[dict[str, Any]]:
-    """历史反思列表（问题与思考 + 明日计划，按日期倒序）。"""
+    """历史计划列表（明日计划，按日期倒序）。"""
     return _storage().list_reflections(limit=limit)
 
 
 @app.get("/api/reflections/{report_date}")
 def get_reflection(report_date: str) -> dict[str, Any]:
-    """某天的反思记录。"""
+    """某天的计划记录。"""
     try:
         target = date.fromisoformat(report_date)
     except ValueError as exc:

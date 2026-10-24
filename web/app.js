@@ -137,7 +137,7 @@
       '<div class="notice notice--info" style="margin:0">' +
       icon("info", 16) +
       "<span>会从配置的 GitHub 仓库采集当日 <strong>commit 记录</strong>（说明、作者、+行/−行、改动文件数），" +
-      "并从飞书采集任务状态变更；再按成员生成日报、可选邮件推送。" +
+      "并从飞书采集任务状态变更；再按成员生成日报，并推送邮件与飞书群。" +
       "写入日报的是提交摘要与统计，按设计<strong>不含代码 diff / 源文件正文</strong>。</span></div>"
     );
   }
@@ -243,9 +243,9 @@
 
   function renderTopActions() {
     document.getElementById("topbarActions").innerHTML =
-      '<button class="btn btn--primary" data-action="generate" title="触发采集 → 生成 → 写入 SQLite（默认 dry-run，不发信）">' +
+      '<button class="btn btn--primary" data-action="generate" title="触发采集 → 生成 → 写入 SQLite → 自动发送邮件与飞书群">' +
       icon("refresh") +
-      "生成今日日报</button>";
+      "生成并发送日报</button>";
   }
 
   async function routeTo() {
@@ -413,7 +413,7 @@
     var headActions =
       '<button class="btn btn--primary" data-action="generate">' +
       icon("refresh") +
-      "生成今日日报</button>" +
+      "生成并发送日报</button>" +
       '<button class="btn" data-action="list-refresh">' +
       icon("refresh") +
       "刷新列表</button>";
@@ -486,8 +486,8 @@
     if (!list.length) {
       return emptyState(
         "暂无日报存档",
-        "SQLite 里还没有日报。请先配置成员与数据源，再点击「生成今日日报」（等价于命令行 main.py --dry-run --force）。",
-        '<button class="btn btn--primary" data-action="generate">' + icon("refresh") + "生成今日日报</button>"
+        "SQLite 里还没有日报。请先配置成员与数据源，再点击「生成并发送日报」——采集生成后会自动发送邮件与飞书群。",
+        '<button class="btn btn--primary" data-action="generate">' + icon("refresh") + "生成并发送日报</button>"
       );
     }
 
@@ -655,7 +655,7 @@
         '<div class="tabs" role="tablist">' +
         tabBtn("analysis", "分析", state.detailTab === "analysis") +
         tabBtn("members", "按成员查看", state.detailTab === "members") +
-        tabBtn("reflection", "反思", state.detailTab === "reflection") +
+        tabBtn("reflection", "明日计划", state.detailTab === "reflection") +
         tabBtn("preview", "邮件 HTML", state.detailTab === "preview") +
         tabBtn("markdown", "Markdown", state.detailTab === "markdown") +
         "</div>" +
@@ -1006,18 +1006,16 @@
     if (!a) {
       return (
         '<div class="card__body">' +
-        emptyState("暂无反思数据", "该日报没有归档问题与思考 / 明日计划。") +
+        emptyState("暂无明日计划", "该日报没有归档明日计划。") +
         "</div>"
       );
     }
-    var problems = a.problems || [];
     var nextPlan = a.next_plan || [];
-    var aiProblems = a.ai_problems || [];
     var aiNextPlan = a.ai_next_plan || [];
-    if (!problems.length && !nextPlan.length && !aiProblems.length && !aiNextPlan.length) {
+    if (!nextPlan.length && !aiNextPlan.length) {
       return (
         '<div class="card__body">' +
-        emptyState("暂无反思数据", "该日报没有可展示的问题与思考 / 明日计划。") +
+        emptyState("暂无明日计划", "该日报没有可展示的明日计划。") +
         "</div>"
       );
     }
@@ -1029,7 +1027,6 @@
       "<span>来源：" +
       esc(srcLabel) +
       "。AI 草稿与最终内容并列展示，便于对比。</span></div>" +
-      reflectionList("问题与思考", problems, aiProblems, a.reflection_source) +
       reflectionList("明日计划", nextPlan, aiNextPlan, a.reflection_source) +
       "</div>"
     );
@@ -1839,7 +1836,7 @@
         "<h2>管道运行</h2><p class=\"page-head__desc\">后端主入口是一次性任务（main.py / cron），不会常驻。此处根据已存日报还原最近几次管道结果摘要。</p>" +
         '</div><div class="page-head__actions"><button class="btn btn--primary" data-action="generate">' +
         icon("refresh") +
-        "生成今日日报</button></div></div><div class=\"card\">" +
+        "生成并发送日报</button></div></div><div class=\"card\">" +
         table +
         "</div></div>",
     };
@@ -1852,12 +1849,13 @@
     toast(
       "info",
       "管道执行中",
-      "采集提交记录与任务变更 → 按成员聚合 → 生成日报 → 写入 SQLite（dry-run，不发信）"
+      "采集提交记录与任务变更 → 按成员聚合 → 生成日报 → 写入 SQLite → 发送邮件与飞书群"
     );
     try {
-      var resp = await ReportAPI.generate({ dry_run: true, force: true });
-      toast("ok", "日报已生成", resp.message || "已写入本地存档，可在「日报历史」查看");
+      var resp = await ReportAPI.generate({ dry_run: false, force: true });
+      toast("ok", "日报已生成", resp.message || "已生成并推送邮件与飞书群");
       state.reports = [];
+      state.emails = [];
       await loadReports();
       routeTo();
     } catch (err) {

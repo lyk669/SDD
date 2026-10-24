@@ -12,7 +12,6 @@ v4.3 改动：
   ## 今日亮点
   ## 工作明细（分类概览 + 全天汇总 + 提交明细）
   ## 飞书协作动态
-  ## 问题与思考
   ## 明日计划
   ## 风险与待办
   底部元信息
@@ -437,7 +436,7 @@ def _render_one_commit_html(c: dict, esc) -> str:
     return "".join(parts)
 
 
-# ============ 双源渲染（问题与思考 / 明日计划） ============
+# ============ 双源渲染（明日计划） ============
 
 def _render_dual_source_markdown(final_items, ai_items, source: str) -> list:
     lines = []
@@ -520,9 +519,7 @@ def _render_markdown(
     commit_summaries: dict,
     issue_number: int,
     risks: list,
-    problems: list,
     next_plan: list,
-    ai_problems: list,
     ai_next_plan: list,
     reflection_source: str,
     comparison: dict | None = None,
@@ -721,12 +718,6 @@ def _render_markdown(
                 )
                 lines.append("")
 
-    # 问题与思考
-    if problems or ai_problems:
-        lines.append("## 问题与思考")
-        lines.append("")
-        lines.extend(_render_dual_source_markdown(problems, ai_problems, reflection_source))
-
     # 明日计划
     if next_plan or ai_next_plan:
         lines.append("## 明日计划")
@@ -771,9 +762,7 @@ def _render_html(
     commit_summaries: dict,
     issue_number: int,
     risks: list,
-    problems: list,
     next_plan: list,
-    ai_problems: list,
     ai_next_plan: list,
     reflection_source: str,
     comparison: dict | None = None,
@@ -1016,14 +1005,6 @@ def _render_html(
                          f"本日共收到 <b>{total_msgs}</b> 条消息，保留 <b>{kept}</b> 条，"
                          f"过滤 <b>{skipped}</b> 条（撤回 / @某人 / 太短 / 系统消息）。</p>")
 
-    # 问题与思考
-    if problems or ai_problems:
-        p.append("<h2 style='" + h2_style + "'>问题与思考</h2>")
-        p.append("<div style='background:#f5f0ff;border-left:4px solid #8b5cf6;"
-                 "border-radius:6px;padding:12px 16px;margin:10px 0;'>")
-        p.append(_render_dual_source_html(problems, ai_problems, reflection_source))
-        p.append("</div>")
-
     # 明日计划
     if next_plan or ai_next_plan:
         p.append("<h2 style='" + h2_style + "'>明日计划</h2>")
@@ -1068,9 +1049,7 @@ def generate(
     commit_summaries: dict[str, str] | None = None,
     issue_number: int = 0,
     risks: list[dict] | None = None,
-    problems: list[dict] | None = None,
     next_plan: list[dict] | None = None,
-    ai_problems: list[dict] | None = None,
     ai_next_plan: list[dict] | None = None,
     reflection_source: str = "ai",
     comparison: dict | None = None,
@@ -1086,9 +1065,7 @@ def generate(
     action_items = action_items or []
     commit_summaries = commit_summaries or {}
     risks = risks or []
-    problems = problems or []
     next_plan = next_plan or []
-    ai_problems = ai_problems or []
     ai_next_plan = ai_next_plan or []
     comparison = comparison or None
     summary = (summary or "").strip()
@@ -1119,9 +1096,7 @@ def generate(
         commit_summaries=commit_summaries,
         issue_number=issue_number,
         risks=risks,
-        problems=problems,
         next_plan=next_plan,
-        ai_problems=ai_problems,
         ai_next_plan=ai_next_plan,
         reflection_source=reflection_source,
         comparison=comparison,
